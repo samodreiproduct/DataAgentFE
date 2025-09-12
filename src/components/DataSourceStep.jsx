@@ -6,6 +6,8 @@ import { useLeadFlow } from "../context/LeadFlowContext"; // ✅ context
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
 import { getAuthHeaders, getAuthUser } from "../context/LeadFlowContext";
+const API_BASE = import.meta.env.VITE_API_BASE;
+
 // -- phone helpers (de-dupe & pretty) --
 const DIGITS = /\d/g;
 const digitsOnly = (s) => (s ? (s + "").match(DIGITS)?.join("") ?? "" : "");
@@ -273,7 +275,7 @@ export default function DataSourceStep({
     formData.append("column_mapping", JSON.stringify(mapping)); // 🔥 REQUIRED
     formData.append("primary_key", primaryKey || "");
 
-    const resp = await fetch("http://localhost:8000/upload-csv", {
+    const resp = await fetch(`${API_BASE}/upload-csv`, {
       method: "POST",
       headers: {
         ...authHeaders,
@@ -313,7 +315,7 @@ export default function DataSourceStep({
   }
 
   async function saveMapping() {
-    const resp = await fetch("http://localhost:8000/remap-columns", {
+    const resp = await fetch(`${API_BASE}/remap-columns`, {
       method: "POST",
       headers: {
         ...getAuthHeaders(),
@@ -540,7 +542,7 @@ export default function DataSourceStep({
               },
       };
 
-      const resp = await fetch("http://localhost:8000/manual-entry", {
+      const resp = await fetch(`${API_BASE}/manual-entry`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -658,18 +660,15 @@ export default function DataSourceStep({
     try {
       if (geography === "United States" && industry === "Healthcare") {
         // ---------- NPI SCRAPING ----------
-        const resp = await fetch(
-          "http://localhost:8000/healthcare-speciality",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", ...authHeaders },
-            body: JSON.stringify({
-              region: regionScope,
-              specialty: speciality,
-              session_id: sid, // ✅ passed from parent
-            }),
-          }
-        );
+        const resp = await fetch(`${API_BASE}/healthcare-speciality`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({
+            region: regionScope,
+            specialty: speciality,
+            session_id: sid, // ✅ passed from parent
+          }),
+        });
 
         if (!resp.ok) {
           const txt = await resp.text();
@@ -699,7 +698,7 @@ export default function DataSourceStep({
         setScrapeError(null);
       } else {
         // ---------- NON-NPI SCRAPING (unchanged) ----------
-        const resp = await fetch("http://localhost:8000/beautifulsoup-scrape", {
+        const resp = await fetch(`${API_BASE}/beautifulsoup-scrape`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
           body: JSON.stringify({

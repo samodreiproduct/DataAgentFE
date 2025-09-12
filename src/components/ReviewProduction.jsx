@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { getAuthUser, getAuthHeaders } from "../context/LeadFlowContext";
-
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 function safeParseArray(v) {
   if (!v) return [];

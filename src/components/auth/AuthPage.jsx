@@ -8,6 +8,7 @@ export default function AuthPage({ onLoginSuccess }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const { toast } = useToast();
+  const API_BASE = import.meta.env.VITE_API_BASE;
 
   // keep user logged in across refresh (safe parse)
   useEffect(() => {
@@ -30,7 +31,7 @@ export default function AuthPage({ onLoginSuccess }) {
 
     const endpoint = isSignup ? "signup" : "login";
     try {
-      const resp = await fetch(`http://localhost:8000/${endpoint}`, {
+      const resp = await fetch(`${API_BASE}/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),

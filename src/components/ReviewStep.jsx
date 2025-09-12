@@ -5,7 +5,7 @@ import FaxList from "../reusableComponents/FaxList";
 import EmailList from "../reusableComponents/EmailList";
 import { useToast } from "@/components/ui/use-toast";
 import { getAuthUser, getAuthHeaders } from "../context/LeadFlowContext";
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function ReviewStep({ prevStep, nextStep, sessionId }) {
   const [rows, setRows] = useState([]);

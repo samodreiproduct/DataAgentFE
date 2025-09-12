@@ -6,7 +6,7 @@ import StepSection from "./StepSection";
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
 import { useLeadFlow } from "../context/LeadFlowContext";
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
   const { flowData } = useLeadFlow();

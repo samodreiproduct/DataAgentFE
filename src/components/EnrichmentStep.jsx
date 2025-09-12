@@ -5,8 +5,7 @@ import React, { useEffect, useMemo, useState, useCallback } from "react";
 import StepSection from "./StepSection";
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
-
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function EnrichmentStep({
   prevStep,
