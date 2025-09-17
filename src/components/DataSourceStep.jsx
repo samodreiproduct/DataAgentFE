@@ -99,6 +99,32 @@ const usStates = [
   "Wyoming",
 ];
 
+const PERSON_FIELDS = [
+  "npi",
+  "first_name",
+  "last_name",
+  "email",
+  "phone_number",
+  "fax",
+  "specialty",
+  "mailing_address",
+  "primary_address",
+  "secondary_address",
+  "degree",
+  "linkedin",
+];
+
+const COMPANY_FIELDS = [
+  "name",
+  "address",
+  "phone",
+  "email",
+  "website",
+  "linkedin_url",
+  "nature_of_company",
+  "region",
+];
+
 export default function DataSourceStep({
   sessionId,
   newSessionForFetch,
@@ -120,6 +146,13 @@ export default function DataSourceStep({
   const [scrapeResults, setScrapeResults] = useState([]);
   const [scrapeLoading, setScrapeLoading] = useState(false);
   const [scrapeError, setScrapeError] = useState(null);
+  // Pagination for scraping results (frontend)
+  const [scrapePage, setScrapePage] = useState(0);
+  const SCRAPE_PAGE_SIZE = 50;
+  // file preview / upload rows come from parent props (uploadedRows)
+  // Pagination for uploaded file preview
+  const [uploadPage, setUploadPage] = useState(0);
+  const UPLOAD_PAGE_SIZE = 50;
   const [speciality, setSpeciality] = useState("");
   const [regionScope, setRegionScope] = useState("");
   const [uploadTarget, setUploadTarget] = useState("");
@@ -311,7 +344,8 @@ export default function DataSourceStep({
     });
 
     // Show only first 100 rows in preview
-    setUploadedRows(data.unique_data.slice(0, 100));
+    setUploadedRows(data.unique_data);
+    setUploadPage(0);
   }
 
   async function saveMapping() {
@@ -381,13 +415,7 @@ export default function DataSourceStep({
       '#scraping-form input[name="roles"]:checked'
     );
     const roles = Array.from(roleNodes).map((n) => n.value);
-
-    const sourceNodes = document.querySelectorAll(
-      '#scraping-form input[name="sources"]:checked'
-    );
-    const sources = Array.from(sourceNodes).map((n) => n.value);
-
-    return { geography, industry, roles, sources };
+    return { geography, industry, roles };
   }
 
   // ---------- NPI helpers ----------
@@ -400,6 +428,26 @@ export default function DataSourceStep({
     ].filter(Boolean);
     return parts.length ? parts.join(" • ") : "-";
   };
+
+  // derived slices for pagination
+  const pagedScrapeRows = scrapeResults.slice(
+    scrapePage * SCRAPE_PAGE_SIZE,
+    (scrapePage + 1) * SCRAPE_PAGE_SIZE
+  );
+
+  const scrapeTotalPages = Math.max(
+    1,
+    Math.ceil(scrapeResults.length / SCRAPE_PAGE_SIZE)
+  );
+
+  const pagedUploadRows = (uploadedRows || []).slice(
+    uploadPage * UPLOAD_PAGE_SIZE,
+    (uploadPage + 1) * UPLOAD_PAGE_SIZE
+  );
+  const uploadTotalPages = Math.max(
+    1,
+    Math.ceil((uploadedRows || []).length / UPLOAD_PAGE_SIZE)
+  );
 
   const nameFromNpiResult = (r = {}) => {
     const basic = r.basic || {};
@@ -624,13 +672,14 @@ export default function DataSourceStep({
   // ---------- fetch ----------
   async function handleStartScraping() {
     const authHeaders = getAuthHeaders();
+    const auth = getAuthUser();
     setScrapeError(null);
     setScrapeLoading(true);
     // 🔑 always start fresh session for each fetch
     const sid = newSessionForFetch(); // <-- from parent (SamodreiDataAgent)
     console.log("🔄 New Session for fetch:", sid);
 
-    const { geography, industry, roles, sources } = gatherScrapeFormValues();
+    const { geography, industry, roles } = gatherScrapeFormValues();
 
     if (!geography || geography === "Select Region") {
       setScrapeError("Please select a target geography.");
@@ -695,19 +744,46 @@ export default function DataSourceStep({
         // Update state to show in frontend table
         const mappedLeads = mapNpiResults(data.results || []);
         setScrapeResults(mappedLeads);
+        setScrapePage(0);
+
         setScrapeError(null);
+        // update flow context so dedup picks up person rows
+        updateFlowData(sid, {
+          uploadedData: mappedLeads,
+          columns: [
+            "npi",
+            "name",
+            "email",
+            "phone",
+            "fax",
+            "specialty",
+            "mailing_address",
+            "primary_address",
+            "secondary_address",
+          ],
+          dedupStats: {
+            total_rows: mappedLeads.length,
+            unique_rows: mappedLeads.length,
+            duplicates_found: 0,
+            actions_taken: 0,
+          },
+          sourceType: "scraping",
+          dataNature: "person",
+        });
       } else {
-        // ---------- NON-NPI SCRAPING (unchanged) ----------
-        const resp = await fetch(`${API_BASE}/beautifulsoup-scrape`, {
+        // ---------- COMPANY SCRAPING ----------
+        const resp = await fetch(`${API_BASE}/company-data`, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
           body: JSON.stringify({
+            Nature_of_company: industry,
             region: geography,
-            industry,
-            niche: speciality,
+            speciality,
             roles,
-            sources,
-            limit: 50,
+            session_id: sid,
+            limit: 2,
+            linkedin_scrape: false, // or true if you want LinkedIn enrichment immediately
+            source_user_id: auth?.user_id || undefined,
           }),
         });
 
@@ -717,36 +793,49 @@ export default function DataSourceStep({
         }
 
         const data = await resp.json();
-        const items = data?.leads || [];
+        const items = data?.results || []; // company-data returns `results`
 
         const mappedLeads = items.map((lead) => {
-          const nameFromBasic = [
-            lead?.basic?.first_name,
-            lead?.basic?.last_name,
-          ]
-            .filter(Boolean)
-            .join(" ");
           return {
-            name: lead?.name || nameFromBasic || "-",
-            email: lead?.email || lead?.basic?.email || "-",
-            company:
-              lead?.organization ||
-              lead?.company ||
-              lead?.basic?.organization_name ||
-              "-",
-            title:
-              lead?.title ||
-              lead?.role ||
-              lead?.taxonomies?.[0]?.desc ||
-              lead?.taxonomy ||
-              "-",
-            source: lead?.source || "Scrape",
-            confidence:
-              typeof lead?.confidence === "number" ? lead.confidence : 0.9,
+            // core fields returned by company endpoint
+            name: lead?.name || "-",
+            address: lead?.address || "-",
+            phone: lead?.phone || "-",
+            email: lead?.email || "-",
+            website: lead?.website || "-",
+            linkedin_url: lead?.linkedin_url || "",
+            // legacy compatibility if other code expects these
+            company: lead?.name || "-",
+            title: "-",
+            company_id: lead?.company_id ?? lead?.companyId ?? null,
+            session_id: sid,
           };
         });
+        console.log("RAW SERP:", data.raw_sample);
 
-        setScrapeResults(mappedLeads); // optionally show in frontend
+        setScrapeResults(mappedLeads);
+        setScrapePage(0);
+
+        // update global flow context so Deduplication step knows this is company data
+        updateFlowData(sid, {
+          uploadedData: mappedLeads,
+          columns: [
+            "name",
+            "address",
+            "phone",
+            "email",
+            "website",
+            "linkedin_url",
+          ],
+          dedupStats: {
+            total_rows: mappedLeads.length,
+            unique_rows: mappedLeads.length, // backend dedupe happens on insert — adjust if you compute server-side
+            duplicates_found: 0,
+            actions_taken: 0,
+          },
+          sourceType: "scraping",
+          dataNature: "company", // <-- IMPORTANT: dedup will now fetch company rows
+        });
       }
     } catch (err) {
       console.error("Scrape error:", err);
@@ -956,28 +1045,13 @@ export default function DataSourceStep({
             </div>
           )}
 
-          {/* Data Sources */}
+          {/* Data Source (always SERP/Google Maps) */}
           {!isNPI && (
             <div className="form-group">
-              <label className="form-label">Data Sources</label>
-              <div className="checkbox-grid">
-                {[
-                  "LinkedIn Sales Navigator",
-                  "Clutch.co Directory",
-                  "AngelList (Wellfound)",
-                  "Crunchbase",
-                ].map((src, i) => (
-                  <div className="checkbox-item" key={i}>
-                    <input
-                      type="checkbox"
-                      id={`src-${i}`}
-                      name="sources"
-                      value={src}
-                      defaultChecked={i < 2}
-                    />
-                    <label htmlFor={`src-${i}`}>{src}</label>
-                  </div>
-                ))}
+              <label className="form-label">Data Source</label>
+              <div className="checkbox-item">
+                <input type="checkbox" checked disabled readOnly />
+                <label>Google Maps (via SERP API)</label>
               </div>
             </div>
           )}
@@ -1026,18 +1100,19 @@ export default function DataSourceStep({
                     ) : (
                       <>
                         <th>Name</th>
+                        <th>Address</th>
+                        <th style={{ minWidth: "160px" }}>Phone</th>
                         <th>Email</th>
-                        <th>Company</th>
-                        <th>Role</th>
-                        <th>Source</th>
-                        <th>Confidence</th>
+                        <th>Website</th>
+                        <th>LinkedIn</th>
                       </>
                     )}
                   </tr>
                 </thead>
                 <tbody>
-                  {scrapeResults.map((row, idx) =>
-                    isNPI ? (
+                  {pagedScrapeRows.map((row, i) => {
+                    const idx = scrapePage * SCRAPE_PAGE_SIZE + i;
+                    return isNPI ? (
                       <tr key={idx}>
                         <td>{row.npi || "-"}</td>
                         <td>{row.name}</td>
@@ -1062,15 +1137,78 @@ export default function DataSourceStep({
                     ) : (
                       <tr key={idx}>
                         <td>{row.name}</td>
-                        <td>{row.email}</td>
-                        <td>{row.company}</td>
-                        <td>{row.title}</td>
-                        <td>{row.source}</td>
-                        <td>{Math.round((row.confidence || 0) * 100)}%</td>
+                        <td style={{ whiteSpace: "pre-wrap", maxWidth: 300 }}>
+                          {row.address}
+                        </td>
+                        <td className="phone">
+                          {row.phone
+                            ? prettyPhone(digitsOnly(String(row.phone)))
+                            : "-"}
+                        </td>
+                        <td>{row.email || "-"}</td>
+                        <td>
+                          {row.website ? (
+                            <a
+                              href={row.website}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {row.website}
+                            </a>
+                          ) : (
+                            "-"
+                          )}
+                        </td>
+                        <td>
+                          {row.linkedin_url ? (
+                            <a
+                              href={row.linkedin_url}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              LinkedIn
+                            </a>
+                          ) : (
+                            "-"
+                          )}
+                        </td>
                       </tr>
-                    )
-                  )}
+                    );
+                  })}
                 </tbody>
+                {/* Scrape pagination controls */}
+                {scrapeResults.length > SCRAPE_PAGE_SIZE && (
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "center",
+                      gap: 12,
+                      marginTop: 10,
+                    }}
+                  >
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setScrapePage((p) => Math.max(0, p - 1))}
+                      disabled={scrapePage <= 0}
+                    >
+                      ← Previous
+                    </button>
+                    <div style={{ alignSelf: "center" }}>
+                      Page {scrapePage + 1} of {scrapeTotalPages}
+                    </div>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() =>
+                        setScrapePage((p) =>
+                          Math.min(scrapeTotalPages - 1, p + 1)
+                        )
+                      }
+                      disabled={scrapePage >= scrapeTotalPages - 1}
+                    >
+                      Next →
+                    </button>
+                  </div>
+                )}
               </table>
             ) : scrapeLoading ? (
               <p>⏳ Fetching leads...</p>
@@ -1178,8 +1316,8 @@ export default function DataSourceStep({
                 </thead>
                 <tbody>
                   {uploadedRows && uploadedRows.length > 0
-                    ? uploadedRows.slice(0, 50).map((row, i) => (
-                        <tr key={i}>
+                    ? pagedUploadRows.map((row, i) => (
+                        <tr key={uploadPage * UPLOAD_PAGE_SIZE + i}>
                           {Object.values(row).map((val, j) => (
                             <td key={j}>{val}</td>
                           ))}
@@ -1188,6 +1326,40 @@ export default function DataSourceStep({
                     : null}
                 </tbody>
               </table>
+              {/* Upload preview pagination */}
+              {uploadedRows && uploadedRows.length > UPLOAD_PAGE_SIZE && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "center",
+                    gap: 12,
+                    marginTop: 10,
+                  }}
+                >
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => setUploadPage((p) => Math.max(0, p - 1))}
+                    disabled={uploadPage <= 0}
+                  >
+                    ← Previous
+                  </button>
+                  <div style={{ alignSelf: "center" }}>
+                    Page {uploadPage + 1} of {uploadTotalPages}
+                  </div>
+                  <button
+                    className="btn btn-secondary btn-sm"
+                    onClick={() =>
+                      setUploadPage((p) =>
+                        Math.min(uploadTotalPages - 1, p + 1)
+                      )
+                    }
+                    disabled={uploadPage >= uploadTotalPages - 1}
+                  >
+                    Next →
+                  </button>
+                </div>
+              )}
+
               <p
                 style={{
                   marginTop: "8px",
@@ -1237,30 +1409,34 @@ export default function DataSourceStep({
           {editingMapping && (
             <div style={{ marginTop: "1rem" }}>
               <h4>Adjust Column Mapping</h4>
-              {Object.keys(mappingSummary.final_mapping || {}).map((target) => (
-                <div key={target} className="form-group">
-                  <label>{target}</label>
-                  <select
-                    className="form-select"
-                    value={mappingSummary.final_mapping[target]}
-                    onChange={(e) =>
-                      setMappingSummary((prev) => ({
-                        ...prev,
-                        final_mapping: {
-                          ...prev.final_mapping,
-                          [target]: e.target.value,
-                        },
-                      }))
-                    }
-                  >
-                    {Object.keys(uploadedRows[0] || {}).map((col) => (
-                      <option key={col} value={col}>
-                        {col}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              ))}
+              {(uploadTarget === "person" ? PERSON_FIELDS : COMPANY_FIELDS).map(
+                (target) => (
+                  <div key={target} className="form-group">
+                    <label>{target}</label>
+                    <select
+                      className="form-select"
+                      value={mappingSummary.final_mapping?.[target] || ""}
+                      onChange={(e) =>
+                        setMappingSummary((prev) => ({
+                          ...prev,
+                          final_mapping: {
+                            ...prev.final_mapping,
+                            [target]: e.target.value,
+                          },
+                        }))
+                      }
+                    >
+                      <option value="">-- not mapped --</option>
+                      {Object.keys(uploadedRows[0] || {}).map((col) => (
+                        <option key={col} value={col}>
+                          {col}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )
+              )}
+
               <button
                 className="btn btn-primary btn-sm"
                 style={{ marginTop: "10px" }}

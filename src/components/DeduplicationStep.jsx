@@ -13,18 +13,23 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
   const sessionData = flowData[sessionId] || {};
   const precomputedStats = sessionData.dedupStats;
   const sourceType = sessionData.sourceType;
-
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
-
   // optimistic state
   const [localActions, setLocalActions] = useState({}); // key -> "KEEP" | "DISCARD"
   const [pending, setPending] = useState({}); // key -> boolean
 
   // ------------ helpers (same address formatting as DataSourceStep) ------------
   const rowKey = (r, idx) => {
-    const id = r.personpi ?? r.id ?? idx;
-    return `${String(r.npi || "").trim()}::${id}`;
+    const id = r.personpi ?? r.company_id ?? r.id ?? idx;
+    const npiKey = String(r.npi || "").trim();
+    // company key fallback: use normalized name + address (join) so keys are deterministic
+    const companyKey = (
+      String(r.name || "").trim() +
+      "||" +
+      String(r.address || "").trim()
+    ).trim();
+    return `${npiKey || companyKey}::${id}`;
   };
   const preferredOrder = [
     "npi",
@@ -86,11 +91,13 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
     if (!sessionId) return;
     setLoading(true);
     try {
+      const nature = sessionData.dataNature || "person"; // ← decide person or company
       const res = await fetch(
-        `${API_BASE}/deduplicate?data_nature=person&session_id=${encodeURIComponent(
+        `${API_BASE}/deduplicate?data_nature=${nature}&session_id=${encodeURIComponent(
           sessionId
         )}`
       );
+
       const data = await res.json();
       if (data?.status === "success") {
         const all = Array.isArray(data.all_records) ? data.all_records : [];
@@ -104,7 +111,7 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, sessionData.dataNature]);
 
   useEffect(() => {
     fetchDedup();
@@ -115,7 +122,13 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
     const counts = new Map();
     const firstIdx = new Map();
     rows.forEach((r, idx) => {
-      const key = String(r.npi || "").trim();
+      const npiKey = String(r.npi || "").trim();
+      const companyKey = (
+        String(r.name || "").trim() +
+        "||" +
+        String(r.address || "").trim()
+      ).trim();
+      const key = npiKey || companyKey;
       if (!key) return;
       counts.set(key, (counts.get(key) || 0) + 1);
       if (!firstIdx.has(key)) firstIdx.set(key, idx);
@@ -185,10 +198,11 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
   );
 
   // ------------ POST helpers ------------
-  const postKeep = async (session_id, npi, personpi) => {
+  const postKeep = async (session_id, recordId, nature) => {
     const url = `${API_BASE}/deduplicate/keep?session_id=${encodeURIComponent(
       session_id
-    )}&npi=${encodeURIComponent(npi)}&personpi=${encodeURIComponent(personpi)}`;
+    )}&record_id=${encodeURIComponent(recordId)}&data_nature=${nature}`;
+
     const res = await fetch(url, { method: "POST" });
     if (!res.ok) {
       const t = await res.text().catch(() => "");
@@ -197,10 +211,10 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
     return res.json().catch(() => ({}));
   };
 
-  const postDiscard = async (session_id, npi, personpi) => {
+  const postDiscard = async (session_id, recordId, nature) => {
     const url = `${API_BASE}/deduplicate/discard?session_id=${encodeURIComponent(
       session_id
-    )}&npi=${encodeURIComponent(npi)}&personpi=${encodeURIComponent(personpi)}`;
+    )}&record_id=${encodeURIComponent(recordId)}&data_nature=${nature}`;
     const res = await fetch(url, { method: "POST" });
     if (!res.ok) {
       const t = await res.text().catch(() => "");
@@ -211,21 +225,21 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
 
   // ------------ optimistic actions ------------
   const handleAction = async (r, idx, action) => {
-    const npi = String(r.npi || "").trim();
-    const personpi = r.personpi ?? r.id ?? idx;
-    if (!npi || !sessionId) return;
+    const nature = sessionData.dataNature || "person";
+    const recordId = nature === "person" ? r.personpi : r.company_id;
+    if (!recordId || !sessionId) return;
     const key = rowKey(r, idx);
-
     // Optimistic update
     setLocalActions((prev) => ({ ...prev, [key]: action }));
     setPending((p) => ({ ...p, [key]: true }));
 
     try {
       if (action === "KEEP") {
-        await postKeep(sessionId, npi, personpi); // <-- FIXED: call keep
+        await postKeep(sessionId, recordId, nature);
       } else {
-        await postDiscard(sessionId, npi, personpi);
+        await postDiscard(sessionId, recordId, nature);
       }
+
       // success keeps optimistic state; buttons hide automatically
     } catch (err) {
       console.error(`Failed to ${action.toLowerCase()} duplicate:`, err);
@@ -356,7 +370,7 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                         </th>
                       ))}
                   </>
-                ) : (
+                ) : (sessionData.dataNature || "person") === "person" ? (
                   <>
                     <th>NPI</th>
                     <th>Name</th>
@@ -367,6 +381,16 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                     <th>Mailing Address</th>
                     <th>Primary Address</th>
                     <th>Secondary Address</th>
+                    {showActionColumn && <th>Action</th>}
+                  </>
+                ) : (
+                  <>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Phone</th>
+                    <th>Address</th>
+                    <th>Website</th>
+                    <th>LinkedIn</th>
                     {showActionColumn && <th>Action</th>}
                   </>
                 )}
@@ -466,26 +490,45 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                     const dupLater = isLaterDuplicate(r, idx);
                     const act = effectiveAction(r, idx);
                     const isPending = !!pending[key];
+                    const nature = sessionData.dataNature || "person";
 
                     return (
                       <tr key={key} style={rowStyle(r, idx)}>
-                        <td>{r.npi || "-"}</td>
-                        <td>{getName(r)}</td>
-                        <td>{r.email || "-"}</td>
-                        <td className="phone">
-                          <PhoneList
-                            phone={r.phone}
-                            phone_number={r.phone_number}
-                            phone_numbers={r.phone_numbers}
-                          />
-                        </td>
-                        <td className="fax">
-                          <FaxList fax={r.fax} fax_numbers={r.fax_numbers} />
-                        </td>
-                        <td>{r.specialty || "-"}</td>
-                        <td>{getMailing(r)}</td>
-                        <td>{getPrimary(r)}</td>
-                        <td>{getSecondary(r)}</td>
+                        {nature === "person" ? (
+                          <>
+                            <td>{r.npi || "-"}</td>
+                            <td>{getName(r)}</td>
+                            <td>{r.email || "-"}</td>
+                            <td className="phone">
+                              <PhoneList
+                                phone={r.phone}
+                                phone_number={r.phone_number}
+                                phone_numbers={r.phone_numbers}
+                              />
+                            </td>
+                            <td className="fax">
+                              <FaxList
+                                fax={r.fax}
+                                fax_numbers={r.fax_numbers}
+                              />
+                            </td>
+                            <td>{r.specialty || "-"}</td>
+                            <td>{getMailing(r)}</td>
+                            <td>{getPrimary(r)}</td>
+                            <td>{getSecondary(r)}</td>
+                          </>
+                        ) : (
+                          <>
+                            <td>{r.name || "-"}</td>
+                            <td>{r.email || "-"}</td>
+                            <td className="phone">
+                              <PhoneList phone={r.phone} />
+                            </td>
+                            <td>{r.address || "-"}</td>
+                            <td>{r.website || "-"}</td>
+                            <td>{r.linkedin_url || "-"}</td>
+                          </>
+                        )}
                         {showActionColumn && (
                           <td>
                             {dupLater && !act ? (
