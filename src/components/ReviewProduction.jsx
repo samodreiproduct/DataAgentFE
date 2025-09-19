@@ -28,7 +28,6 @@ function fmtDate(iso) {
   }
 }
 
-// NOTE: accept sessionId prop from parent (SamodreiDataAgent passes sessionId)
 export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
   const [files, setFiles] = useState([]);
   const [selected, setSelected] = useState(null);
@@ -38,8 +37,8 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [dataNature, setDataNature] = useState("person"); // "person" or "company"
 
-  // fetch files whenever component mounts or sessionId changes
   useEffect(() => {
     fetchFiles();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -52,17 +51,14 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
       if (sessionId) url.searchParams.set("session_id", sessionId);
 
       const authUser = getAuthUser();
-      if (authUser && authUser.user_id) {
+      if (authUser?.user_id) {
         url.searchParams.set("user_id", String(authUser.user_id));
       }
       url.searchParams.set("limit", "200");
 
       console.debug("Fetching production files URL:", url.toString());
       const res = await fetch(url.toString(), { headers: getAuthHeaders() });
-      if (!res.ok) {
-        console.error("fetchFiles bad response", res.status, await res.text());
-        throw new Error("Failed to fetch files");
-      }
+      if (!res.ok) throw new Error("Failed to fetch files");
       const data = await res.json();
       setFiles(data.files || []);
     } catch (e) {
@@ -73,21 +69,22 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
     }
   };
 
-  const openFile = async (fileId) => {
+  const openFile = async (fileId, nature = dataNature) => {
     setSelected(fileId);
     setPage(1);
-    await fetchRows(fileId, 1);
+    await fetchRows(fileId, 1, nature);
   };
-  const fetchRows = async (fileId, pageNum = 1) => {
+
+  const fetchRows = async (fileId, pageNum = 1, nature = dataNature) => {
     setRows([]);
     setLoading(true);
     try {
       const params = new URLSearchParams();
       params.set("page", String(pageNum));
       params.set("page_size", String(pageSize));
+      params.set("data_nature", nature);
       const authUser = getAuthUser();
-      if (authUser && authUser.user_id)
-        params.set("user_id", String(authUser.user_id));
+      if (authUser?.user_id) params.set("user_id", String(authUser.user_id));
 
       const url = `${API_BASE}/production/file/${encodeURIComponent(
         fileId
@@ -95,10 +92,7 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
 
       console.debug("Fetching rows URL:", url);
       const res = await fetch(url, { headers: getAuthHeaders() });
-      if (!res.ok) {
-        console.error("fetchRows bad response", res.status, await res.text());
-        throw new Error("Failed to fetch rows");
-      }
+      if (!res.ok) throw new Error("Failed to fetch rows");
       const data = await res.json();
       setRows(data.records || []);
       setTotal(data.total || 0);
@@ -114,9 +108,9 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
 
   const downloadCsv = (fileId) => {
     const params = new URLSearchParams();
+    params.set("data_nature", dataNature);
     const authUser = getAuthUser();
-    if (authUser && authUser.user_id)
-      params.set("user_id", String(authUser.user_id));
+    if (authUser?.user_id) params.set("user_id", String(authUser.user_id));
     const url = `${API_BASE}/production/file/${encodeURIComponent(
       fileId
     )}/download${params.toString() ? `?${params.toString()}` : ""}`;
@@ -247,9 +241,20 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
                   </div>
 
                   <div className="flex items-center gap-2">
+                    <select
+                      value={dataNature}
+                      onChange={(e) => {
+                        setDataNature(e.target.value);
+                        if (selected) fetchRows(selected, 1, e.target.value);
+                      }}
+                      className="input input-sm border rounded px-2 py-1 text-sm"
+                    >
+                      <option value="person">People</option>
+                      <option value="company">Company</option>
+                    </select>
                     <button
                       className="btn btn-secondary"
-                      onClick={() => fetchRows(selected, page)}
+                      onClick={() => fetchRows(selected, page, dataNature)}
                     >
                       Refresh
                     </button>
@@ -274,47 +279,62 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
                   ) : (
                     <table className="data-table w-full">
                       <thead>
-                        <tr>
-                          <th className="text-left">NPI</th>
-                          <th className="text-left">Name</th>
-                          <th className="text-left">Email(s)</th>
-                          <th className="text-left">Phones</th>
-                          <th className="text-left">Specialty</th>
-                          <th className="text-left">Updated</th>
-                        </tr>
+                        {dataNature === "person" ? (
+                          <tr>
+                            <th className="text-left">NPI</th>
+                            <th className="text-left">Name</th>
+                            <th className="text-left">Email(s)</th>
+                            <th className="text-left">Phones</th>
+                            <th className="text-left">Specialty</th>
+                            <th className="text-left">Updated</th>
+                          </tr>
+                        ) : (
+                          <tr>
+                            <th className="text-left">Company ID</th>
+                            <th className="text-left">Name</th>
+                            <th className="text-left">Region</th>
+                            <th className="text-left">Email</th>
+                            <th className="text-left">Phone</th>
+                            <th className="text-left">Updated</th>
+                          </tr>
+                        )}
                       </thead>
                       <tbody>
-                        {rows.map((r) => {
-                          const emails =
-                            (r.email && String(r.email).trim()) ||
-                            (r.co_emails &&
-                              safeParseArray(r.co_emails).join(", ")) ||
-                            "-";
-                          const phones =
-                            (r.co_phones &&
-                              safeParseArray(r.co_phones).join(", ")) ||
-                            r.scraped_phone_number ||
-                            "-";
-                          const name =
-                            `${r.first_name || ""} ${
-                              r.last_name || ""
-                            }`.trim() || "-";
-
-                          return (
+                        {rows.map((r) =>
+                          dataNature === "person" ? (
                             <tr key={r.personpi || `${r.npi}-${Math.random()}`}>
                               <td>{r.npi || "-"}</td>
-                              <td>{name}</td>
-                              <td className="whitespace-normal break-words">
-                                {emails}
+                              <td>
+                                {`${r.first_name || ""} ${
+                                  r.last_name || ""
+                                }`.trim() || "-"}
                               </td>
                               <td className="whitespace-normal break-words">
-                                {phones}
+                                {(r.email && String(r.email).trim()) ||
+                                  (r.co_emails &&
+                                    safeParseArray(r.co_emails).join(", ")) ||
+                                  "-"}
+                              </td>
+                              <td className="whitespace-normal break-words">
+                                {(r.co_phones &&
+                                  safeParseArray(r.co_phones).join(", ")) ||
+                                  r.scraped_phone_number ||
+                                  "-"}
                               </td>
                               <td>{r.specialty || "-"}</td>
                               <td>{fmtDate(r.updated_at || r.created_at)}</td>
                             </tr>
-                          );
-                        })}
+                          ) : (
+                            <tr key={r.company_id}>
+                              <td>{r.company_id}</td>
+                              <td>{r.name || "-"}</td>
+                              <td>{r.region || "-"}</td>
+                              <td>{r.email || "-"}</td>
+                              <td>{r.phone || "-"}</td>
+                              <td>{fmtDate(r.updated_at || r.created_at)}</td>
+                            </tr>
+                          )
+                        )}
                       </tbody>
                     </table>
                   )}
@@ -328,7 +348,9 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
                   <div className="flex items-center gap-2">
                     <button
                       className="btn btn-ghost btn-sm"
-                      onClick={() => fetchRows(selected, Math.max(1, page - 1))}
+                      onClick={() =>
+                        fetchRows(selected, Math.max(1, page - 1), dataNature)
+                      }
                       disabled={page <= 1}
                     >
                       Prev
@@ -341,7 +363,8 @@ export default function ReviewProduction({ sessionId, prevStep, nextStep }) {
                           Math.min(
                             Math.max(1, Math.ceil(total / pageSize)),
                             page + 1
-                          )
+                          ),
+                          dataNature
                         )
                       }
                       disabled={page * pageSize >= total}

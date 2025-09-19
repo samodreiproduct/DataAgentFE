@@ -50,7 +50,11 @@ export default function SamodreiDataAgent({ authUser, onLogout }) {
     setCurrentStep(stepId);
   }
 
-  function nextStep() {
+  function nextStep(target) {
+    if (typeof target === "string" && steps.includes(target)) {
+      showStep(target);
+      return;
+    }
     const currentIndex = steps.indexOf(currentStep);
     if (currentIndex < steps.length - 1) {
       showStep(steps[currentIndex + 1]);

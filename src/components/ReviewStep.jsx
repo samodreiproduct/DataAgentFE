@@ -4,7 +4,12 @@ import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
 import EmailList from "../reusableComponents/EmailList";
 import { useToast } from "@/components/ui/use-toast";
-import { getAuthUser, getAuthHeaders } from "../context/LeadFlowContext";
+import PaginationControls from "./ui/PaginationControls";
+import {
+  getAuthUser,
+  getAuthHeaders,
+  useLeadFlow,
+} from "../context/LeadFlowContext";
 const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function ReviewStep({ prevStep, nextStep, sessionId }) {
@@ -13,7 +18,18 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
   const [selected, setSelected] = useState([]);
   const [stats, setStats] = useState({ new: 0, updated: 0, unchanged: 0 });
   const [total, setTotal] = useState(0);
+  // pagination
+  const [currentPage, setCurrentPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
+
   const { toast } = useToast();
+
+  // read session data to determine person vs company flows
+  const { flowData } = useLeadFlow();
+  const sessionData = flowData?.[sessionId] || {};
+  const dataNature = (sessionData.dataNature || "person")
+    .toString()
+    .toLowerCase(); // "person" or "company"
 
   // Approved/rejected counts
   const approvedCount = useMemo(() => {
@@ -45,11 +61,9 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
 
   // compute current visible column count (we always show select + action now)
   const colCount = useMemo(() => {
-    const baseCols = 13;
-    const selectCol = 1;
-    const actionCol = 1;
-    return baseCols + selectCol + actionCol;
-  }, []);
+    // person has many columns, company fewer — keep header spanning correct number
+    return dataNature === "company" ? 1 + 7 + 1 + 1 : 1 + 13 + 1 + 1;
+  }, [dataNature]);
 
   const formatAddress = (addr) => {
     if (!addr) return "-";
@@ -74,6 +88,8 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     const efn = (r.enriched_first_name || "").trim();
     const eln = (r.enriched_last_name || "").trim();
     if (efn || eln) return [efn, eln].filter(Boolean).join(" ");
+    // company fallback
+    if (r.name) return r.name;
     return "-";
   };
   const getMailing = (r) => formatAddress(safeJson(r.mailing_address));
@@ -82,6 +98,16 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
 
   // ALWAYS return string ids to avoid numeric/string mismatch in selection
   const getId = (r) => {
+    if (dataNature === "company") {
+      // prefer explicit company id if present
+      const id = r.company_id ?? r.companyId ?? r.id ?? null;
+      if (id) return String(id);
+      // fallback deterministic key: name + address
+      const name = (r.name || r.company || "").trim();
+      const addr = (r.address || getPrimary(r) || "").trim();
+      return String(`${name}|${addr}`);
+    }
+
     const id =
       r.personpi ??
       r.npi ??
@@ -100,12 +126,16 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     try {
       const params = new URLSearchParams();
       params.set("session_id", sessionId);
-      params.set("data_nature", "person");
+      // send data_nature to backend so review endpoint returns correct table
+      params.set("data_nature", dataNature);
 
       const authUser = getAuthUser();
       if (authUser && authUser.user_id) {
         params.set("user_id", String(authUser.user_id));
       }
+
+      params.set("page", String(currentPage));
+      params.set("page_size", String(pageSize));
 
       const url = `${API_BASE}/review?${params.toString()}`;
 
@@ -136,8 +166,7 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
         reviewStatus: (r.reviewStatus || "").toString().toLowerCase(),
       }));
 
-      const recs = normalized.slice(0, 50); // preview cap (backend also caps)
-      setRows(recs);
+      setRows(normalized);
 
       setStats(data?.stats || { new: 0, updated: 0, unchanged: 0 });
       setTotal(data?.total || 0);
@@ -149,25 +178,39 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [sessionId, dataNature, currentPage, pageSize]);
 
   useEffect(() => {
     fetchRows();
   }, [fetchRows]);
+  // clamp page if pageSize/total changes
+  useEffect(() => {
+    const totalPages = Math.max(1, Math.ceil((total || 0) / (pageSize || 1)));
+    if (currentPage >= totalPages) {
+      setCurrentPage(Math.max(0, totalPages - 1));
+    }
+  }, [total, pageSize, currentPage]);
 
-  const visibleIds = useMemo(() => rows.map(getId), [rows]);
+  // slice rows into displayedRows for the current page
+  const displayedRows = useMemo(() => {
+    const start = currentPage * pageSize;
+    const end = start + pageSize;
+    return rows.slice(start, end);
+  }, [rows, currentPage, pageSize]);
 
-  // only rows that are selectable (not unchanged and not rejected)
+  const visibleIds = useMemo(() => displayedRows.map(getId), [displayedRows]);
+
+  // only rows that are selectable (not unchanged and not rejected) — limited to displayedRows
   const selectableVisibleIds = useMemo(
     () =>
-      rows
+      displayedRows
         .filter(
           (r) =>
             (r.reviewStatus || "").toLowerCase() !== "unchanged" &&
             (r.reviewStatus || "").toLowerCase() !== "rejected"
         )
         .map(getId),
-    [rows]
+    [displayedRows]
   );
 
   const selectedSelectable = useMemo(
@@ -203,17 +246,33 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
       )
     );
 
-  // approve one person -> send a JSON array with single id
+  // approve one person/company -> send a JSON array with single id
   const approveOne = async (id) => {
     const row = rows.find((r) => getId(r) === id);
-    const personId = row?.personpi;
-    if (!personId) {
-      toast({ title: "Cannot approve", description: "Missing person id." });
+    if (!row) {
+      toast({ title: "Cannot approve", description: "Row not found." });
+      return;
+    }
+
+    // choose key based on nature
+    const entityId =
+      dataNature === "company"
+        ? row.company_id ?? row.companyId ?? null
+        : row.personpi ?? null;
+
+    if (!entityId) {
+      toast({
+        title: "Cannot approve",
+        description:
+          dataNature === "company"
+            ? "Missing company id."
+            : "Missing person id.",
+      });
       return;
     }
 
     try {
-      const payload = [String(personId)];
+      const payload = [String(entityId)];
       console.log("approveOne payload:", payload);
       const res = await fetch(`${API_BASE}/bulk-approve`, {
         method: "POST",
@@ -236,7 +295,10 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
         markRow(id, "approved");
         toast({
           title: "Approved",
-          description: `Record approved (npi=${row.npi || "—"}).`,
+          description:
+            dataNature === "company"
+              ? `Company approved (id=${entityId}).`
+              : `Record approved (npi=${row.npi || "—"}).`,
         });
         await fetchRows();
       } else {
@@ -266,23 +328,24 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     });
   };
 
-  // bulk approve selected -> send JSON array of personIds
+  // bulk approve selected -> send JSON array of ids (personpi or company_id)
   const bulkApproveSelected = async () => {
     if (!selected.length) return;
 
-    const personIds = rows
+    const idKey = dataNature === "company" ? "company_id" : "personpi";
+
+    const ids = rows
       .filter(
         (r) =>
           selected.includes(getId(r)) &&
-          r.personpi &&
-          (r.reviewStatus || "").toLowerCase() !== "unchanged" &&
+          r[idKey] &&
           (r.reviewStatus || "").toLowerCase() !== "rejected"
       )
-      .map((r) => String(r.personpi)); // ensure strings
+      .map((r) => String(r[idKey])); // ensure strings
 
-    console.log("bulkApproveSelected payload:", personIds);
+    console.log("bulkApproveSelected payload:", ids);
 
-    if (!personIds.length) {
+    if (!ids.length) {
       toast({
         title: "No changes to apply",
         description:
@@ -304,9 +367,7 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     // optimistic UI
     setRows((prev) =>
       prev.map((r) =>
-        personIds.includes(String(r.personpi))
-          ? { ...r, reviewStatus: "approved" }
-          : r
+        ids.includes(String(r[idKey])) ? { ...r, reviewStatus: "approved" } : r
       )
     );
 
@@ -314,7 +375,7 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
       const res = await fetch(`${API_BASE}/bulk-approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify(personIds),
+        body: JSON.stringify(ids),
       });
 
       if (!res.ok) {
@@ -330,9 +391,11 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
 
       const data = await res.json();
       if (data?.status === "success") {
-        const newCount = data.records_transferred?.People_new || 0;
-        const updCount = data.records_transferred?.People_updated || 0;
-        const unchCount = data.records_transferred?.People_unchanged || 0;
+        const typeKey = dataNature === "company" ? "Company" : "People";
+        const newCount = data.records_transferred?.[`${typeKey}_new`] || 0;
+        const updCount = data.records_transferred?.[`${typeKey}_updated`] || 0;
+        const unchCount =
+          data.records_transferred?.[`${typeKey}_unchanged`] || 0;
         toast({
           title:
             newCount + updCount === 0
@@ -363,20 +426,18 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     }
   };
 
-  // bulk approve all -> send NO body
-  // replace existing bulkApproveAll with this
+  // bulk approve all -> send explicit list of ids for current preview (backend may process all in session)
   const bulkApproveAll = async () => {
-    // gather personIds for all selectable staging rows (not unchanged, not rejected)
-    const personIds = rows
+    const idKey = dataNature === "company" ? "company_id" : "personpi";
+    const ids = rows
       .filter(
         (r) =>
-          r.personpi &&
-          (r.reviewStatus || "").toString().toLowerCase() !== "rejected" &&
-          (r.reviewStatus || "").toString().toLowerCase() !== "unchanged"
+          r[idKey] &&
+          (r.reviewStatus || "").toString().toLowerCase() !== "rejected"
       )
-      .map((r) => String(r.personpi));
+      .map((r) => String(r[idKey]));
 
-    if (!personIds.length) {
+    if (!ids.length) {
       toast({
         title: "No rows to approve",
         description: "There are no staging rows eligible for approval.",
@@ -394,7 +455,7 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
       const res = await fetch(`${API_BASE}/bulk-approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify(personIds), // send explicit list
+        body: JSON.stringify(ids), // send explicit list (backend may accept empty body for all)
       });
 
       if (!res.ok) {
@@ -409,9 +470,11 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
 
       const data = await res.json();
       if (data?.status === "success") {
-        const newCount = data.records_transferred?.People_new || 0;
-        const updCount = data.records_transferred?.People_updated || 0;
-        const unchCount = data.records_transferred?.People_unchanged || 0;
+        const typeKey = dataNature === "company" ? "Company" : "People";
+        const newCount = data.records_transferred?.[`${typeKey}_new`] || 0;
+        const updCount = data.records_transferred?.[`${typeKey}_updated`] || 0;
+        const unchCount =
+          data.records_transferred?.[`${typeKey}_unchanged`] || 0;
         toast({
           title:
             newCount + updCount === 0
@@ -513,7 +576,10 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
         </h3>
 
         <div className="table-scroll-x" style={{ overflowX: "auto" }}>
-          <table className="data-table" style={{ minWidth: "1300px" }}>
+          <table
+            className="data-table"
+            style={{ minWidth: dataNature === "company" ? "1000px" : "1300px" }}
+          >
             <thead>
               <tr>
                 {/* Select (always shown) */}
@@ -529,25 +595,41 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
                   />
                 </th>
 
-                {/* >>> EXACT COLUMNS FROM EnrichmentStep.jsx <<< */}
-                <th>NPI</th>
-                <th>Name</th>
-                <th>Email</th>
-                <th style={{ minWidth: "200px" }}>Phone</th>
-                <th style={{ minWidth: "200px" }}>Fax</th>
-                <th>Specialty</th>
-                <th>Mailing Address</th>
-                <th>Primary Address</th>
-                <th>Secondary Address</th>
-                <th style={{ minWidth: "200px" }}>Enriched Phone</th>
-                <th>Doctor Degree &amp; Year</th>
-                <th>Linked-In Profile</th>
+                {dataNature === "person" ? (
+                  // >>> EXACT COLUMNS FROM EnrichmentStep.jsx <<<
+                  <>
+                    <th>NPI</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th style={{ minWidth: "200px" }}>Phone</th>
+                    <th style={{ minWidth: "200px" }}>Fax</th>
+                    <th>Specialty</th>
+                    <th>Mailing Address</th>
+                    <th>Primary Address</th>
+                    <th>Secondary Address</th>
+                    <th style={{ minWidth: "200px" }}>Enriched Phone</th>
+                    <th>Doctor Degree &amp; Year</th>
+                    <th>Linked-In Profile</th>
 
-                {/* NEW Status column */}
-                <th>Status</th>
+                    {/* NEW Status column */}
+                    <th>Status</th>
 
-                {/* Action (always shown) */}
-                <th style={{ whiteSpace: "nowrap" }}>Action</th>
+                    {/* Action (always shown) */}
+                    <th style={{ whiteSpace: "nowrap" }}>Action</th>
+                  </>
+                ) : (
+                  // company columns
+                  <>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Phone</th>
+                    <th>Address</th>
+                    <th>Website</th>
+                    <th>LinkedIn</th>
+                    <th>Status</th>
+                    <th style={{ whiteSpace: "nowrap" }}>Action</th>
+                  </>
+                )}
               </tr>
             </thead>
 
@@ -558,8 +640,8 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
                     Loading… ⏳
                   </td>
                 </tr>
-              ) : rows.length ? (
-                rows.map((r) => {
+              ) : displayedRows.length ? (
+                displayedRows.map((r) => {
                   const id = getId(r);
                   const status = (r.reviewStatus || "").toLowerCase();
 
@@ -582,105 +664,191 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
                           type="checkbox"
                           checked={selected.includes(id)}
                           onChange={() => toggleOne(id)}
-                          disabled={
-                            status === "unchanged" || status === "rejected"
-                          }
+                          disabled={status === "rejected"}
                         />
                       </td>
 
-                      {/* SAME CELLS AS ENRICHMENT */}
-                      <td>{r.npi || "-"}</td>
-                      <td>{getName(r)}</td>
-                      <td>
-                        <EmailList
-                          email={r.email}
-                          co_emails={safeJson(r.co_emails)}
-                        />
-                      </td>
+                      {dataNature === "person" ? (
+                        // SAME CELLS AS ENRICHMENT
+                        <>
+                          <td>{r.npi || "-"}</td>
+                          <td>{getName(r)}</td>
+                          <td>
+                            <EmailList
+                              email={r.email}
+                              co_emails={safeJson(r.co_emails)}
+                            />
+                          </td>
 
-                      <td className="phone">
-                        <PhoneList
-                          phone={r.phone}
-                          phone_number={r.phone_number}
-                          phone_numbers={r.phone_numbers}
-                        />
-                      </td>
-                      <td className="fax">
-                        <FaxList fax={r.fax} fax_numbers={r.fax_numbers} />
-                      </td>
-                      <td>{r.specialty || "-"}</td>
-                      <td>{getMailing(r)}</td>
-                      <td>{getPrimary(r)}</td>
-                      <td>{getSecondary(r)}</td>
-                      <td className="phone">{r.scraped_phone_number || "-"}</td>
-                      <td>
-                        {r.degree || r.degree_year ? (
-                          <>
-                            {r.degree ? <span>{r.degree}</span> : null}
-                            {r.degree_year ? (
-                              <span>
-                                {r.degree ? " • " : ""}
-                                {r.degree_year}
-                              </span>
-                            ) : null}
-                          </>
-                        ) : (
-                          "-"
-                        )}
-                      </td>
-                      <td>
-                        {r.linkedin_url &&
-                        String(r.linkedin_url)
-                          .toLowerCase()
-                          .includes("linkedin.com") ? (
-                          <a
-                            href={r.linkedin_url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="btn btn-secondary btn-sm"
+                          <td className="phone">
+                            <PhoneList
+                              phone={r.phone}
+                              phone_number={r.phone_number}
+                              phone_numbers={r.phone_numbers}
+                            />
+                          </td>
+                          <td className="fax">
+                            <FaxList fax={r.fax} fax_numbers={r.fax_numbers} />
+                          </td>
+                          <td>{r.specialty || "-"}</td>
+                          <td>{getMailing(r)}</td>
+                          <td>{getPrimary(r)}</td>
+                          <td>{getSecondary(r)}</td>
+                          <td className="phone">
+                            {r.scraped_phone_number || "-"}
+                          </td>
+                          <td>
+                            {r.degree || r.degree_year ? (
+                              <>
+                                {r.degree ? <span>{r.degree}</span> : null}
+                                {r.degree_year ? (
+                                  <span>
+                                    {r.degree ? " • " : ""}
+                                    {r.degree_year}
+                                  </span>
+                                ) : null}
+                              </>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
+                          <td>
+                            {r.linkedin_url &&
+                            String(r.linkedin_url)
+                              .toLowerCase()
+                              .includes("linkedin.com") ? (
+                              <a
+                                href={r.linkedin_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="btn btn-secondary btn-sm"
+                              >
+                                Open
+                              </a>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
+
+                          {/* Status */}
+                          <td
+                            style={{
+                              fontWeight: 600,
+                              textTransform: "capitalize",
+                            }}
                           >
-                            Open
-                          </a>
-                        ) : (
-                          "-"
-                        )}
-                      </td>
+                            {r.reviewStatus || "-"}
+                          </td>
 
-                      {/* Status */}
-                      <td
-                        style={{ fontWeight: 600, textTransform: "capitalize" }}
-                      >
-                        {r.reviewStatus || "-"}
-                      </td>
+                          {/* Actions */}
+                          <td style={{ whiteSpace: "nowrap" }}>
+                            <button
+                              className="btn btn-primary"
+                              style={{
+                                marginRight: "0.5rem",
+                                padding: "0.4rem 0.8rem",
+                              }}
+                              disabled={
+                                status === "approved" || status === "rejected"
+                              }
+                              onClick={() => approveOne(id)}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              className="btn btn-secondary"
+                              style={{ padding: "0.4rem 0.8rem" }}
+                              onClick={() => rejectOne(id)}
+                              disabled={status === "rejected"}
+                            >
+                              Reject
+                            </button>
+                          </td>
+                        </>
+                      ) : (
+                        // company row rendering
+                        <>
+                          <td>{r.name || "-"}</td>
+                          <td>{r.email || "-"}</td>
+                          <td className="phone">
+                            <PhoneList
+                              phone={r.phone}
+                              phone_number={r.phone_number}
+                              phone_numbers={r.phone_numbers}
+                            />
+                          </td>
+                          <td>{r.address || getPrimary(r) || "-"}</td>
+                          <td>
+                            {r.website ? (
+                              <a
+                                href={r.website}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                {r.website}
+                              </a>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
+                          <td>
+                            {r.linkedin_url &&
+                            String(r.linkedin_url)
+                              .toLowerCase()
+                              .includes("linkedin.com") ? (
+                              <a
+                                href={r.linkedin_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="btn btn-secondary btn-sm"
+                              >
+                                Open
+                              </a>
+                            ) : (
+                              "-"
+                            )}
+                          </td>
 
-                      {/* Actions */}
-                      <td style={{ whiteSpace: "nowrap" }}>
-                        <button
-                          className="btn btn-primary"
-                          style={{
-                            marginRight: "0.5rem",
-                            padding: "0.4rem 0.8rem",
-                          }}
-                          disabled={
-                            status === "approved" ||
-                            status === "unchanged" ||
-                            status === "rejected"
-                          }
-                          onClick={() => approveOne(id)}
-                        >
-                          Approve
-                        </button>
-                        <button
-                          className="btn btn-secondary"
-                          style={{ padding: "0.4rem 0.8rem" }}
-                          onClick={() => rejectOne(id)}
-                          disabled={
-                            status === "unchanged" || status === "rejected"
-                          }
-                        >
-                          Reject
-                        </button>
-                      </td>
+                          {/* Status */}
+                          <td
+                            style={{
+                              fontWeight: 600,
+                              textTransform: "capitalize",
+                            }}
+                          >
+                            {r.reviewStatus || "-"}
+                          </td>
+
+                          {/* Actions */}
+                          <td style={{ whiteSpace: "nowrap" }}>
+                            <button
+                              className="btn btn-primary"
+                              style={{
+                                marginRight: "0.5rem",
+                                padding: "0.4rem 0.8rem",
+                              }}
+                              disabled={
+                                status === "approved" ||
+                                status === "unchanged" ||
+                                status === "rejected"
+                              }
+                              onClick={() => approveOne(id)}
+                            >
+                              Approve
+                            </button>
+                            <button
+                              className="btn btn-secondary"
+                              style={{ padding: "0.4rem 0.8rem" }}
+                              onClick={() => rejectOne(id)}
+                              disabled={
+                                status === "unchanged" || status === "rejected"
+                              }
+                            >
+                              Reject
+                            </button>
+                          </td>
+                        </>
+                      )}
                     </tr>
                   );
                 })
@@ -694,17 +862,41 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
             </tbody>
           </table>
         </div>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginTop: "1rem",
+          }}
+        >
+          <div>
+            Rows per page:{" "}
+            <select
+              value={pageSize}
+              onChange={(e) => {
+                setCurrentPage(0);
+                setPageSize(Number(e.target.value));
+              }}
+            >
+              <option value={25}>25</option>
+              <option value={50}>50</option>
+              <option value={100}>100</option>
+              <option value={500}>500</option>
+            </select>
+          </div>
+
+          <PaginationControls
+            currentPage={currentPage}
+            totalPages={Math.ceil(total / pageSize)}
+            onPageChange={(p) => setCurrentPage(p)}
+          />
+        </div>
 
         {/* footer showing counts and hint that more rows may be on server */}
         <p style={{ marginTop: "0.5rem", color: "#4b5563" }}>
-          Showing {rows.length} of {total} staging records.
-          {total > rows.length ? (
-            <span>
-              {" "}
-              There are more records in staging — use "Bulk Approve All" to
-              process everything.
-            </span>
-          ) : null}
+          Showing page {currentPage + 1} of {Math.ceil(total / pageSize)} (Total{" "}
+          {total} records)
         </p>
 
         <div className="button-group" style={{ marginTop: 16 }}>

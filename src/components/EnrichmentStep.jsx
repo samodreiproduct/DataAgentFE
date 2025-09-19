@@ -5,6 +5,7 @@ import React, { useEffect, useMemo, useState, useCallback } from "react";
 import StepSection from "./StepSection";
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
+import PaginationControls from "./ui/PaginationControls";
 const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function EnrichmentStep({
@@ -18,6 +19,20 @@ export default function EnrichmentStep({
   const [running, setRunning] = useState(false);
   const [lastRun, setLastRun] = useState(null);
   const [hasRun, setHasRun] = useState(false); // ← gate “Successfully Enriched” until user runs
+  // frontend pagination
+  const ENRICH_PAGE_SIZE_DEFAULT = 50;
+  const [enrichPage, setEnrichPage] = useState(0);
+  const [enrichPageSize, setEnrichPageSize] = useState(
+    ENRICH_PAGE_SIZE_DEFAULT
+  );
+  const enrichTotalPages = Math.max(
+    1,
+    Math.ceil((rows?.length || 0) / enrichPageSize)
+  );
+  const pagedRows = (rows || []).slice(
+    enrichPage * enrichPageSize,
+    (enrichPage + 1) * enrichPageSize
+  );
 
   // ---------- helpers (match DataSource/Dedup formatting) ----------
   const safeJson = (v) => {
@@ -116,6 +131,14 @@ export default function EnrichmentStep({
   useEffect(() => {
     fetchEnrichment();
   }, [fetchEnrichment]);
+
+  // reset to first page when rows or page-size change
+  useEffect(() => {
+    setEnrichPage(0);
+  }, [rows]);
+  useEffect(() => {
+    setEnrichPage(0);
+  }, [enrichPageSize]);
 
   // ---------- run enrichment ----------
   const runEnrichment = async () => {
@@ -299,125 +322,124 @@ export default function EnrichmentStep({
                   </td>
                 </tr>
               ) : rows.length ? (
-                rows.map((r, idx) => (
-                  <tr key={`${r.npi || idx}-${r.personpi || idx}`}>
-                    <td>{r.npi || "-"}</td>
-                    <td>{getName(r)}</td>
-                    <td>
-                      {(() => {
-                        // Collect from new JSON column + legacy single value
-                        const co = asArray(r.co_emails);
-                        const legacy = asArray(r.email);
-                        const all = unique([...co, ...legacy]);
-                        if (!all.length) return "-";
-                        return (
-                          <div
-                            style={{
-                              display: "flex",
-                              flexDirection: "column",
-                              gap: 4,
-                            }}
-                          >
-                            {all.map((em, i) => (
-                              <a
-                                key={em + i}
-                                href={`mailto:${em}`}
-                                style={{
-                                  textDecoration: "none",
-                                  color: "#2563eb",
-                                }}
-                              >
-                                {em}
-                              </a>
-                            ))}
-                          </div>
-                        );
-                      })()}
-                    </td>
+                pagedRows.map((r, i) => {
+                  const idx = enrichPage * enrichPageSize + i; // global index for helpers
+                  return (
+                    <tr key={`${r.npi || idx}-${r.personpi || idx}`}>
+                      <td>{r.npi || "-"}</td>
+                      <td>{getName(r)}</td>
+                      <td>
+                        {(() => {
+                          const co = asArray(r.co_emails);
+                          const legacy = asArray(r.email);
+                          const all = unique([...co, ...legacy]);
+                          if (!all.length) return "-";
+                          return (
+                            <div
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 4,
+                              }}
+                            >
+                              {all.map((em, j) => (
+                                <a
+                                  key={em + j}
+                                  href={`mailto:${em}`}
+                                  style={{
+                                    textDecoration: "none",
+                                    color: "#2563eb",
+                                  }}
+                                >
+                                  {em}
+                                </a>
+                              ))}
+                            </div>
+                          );
+                        })()}
+                      </td>
 
-                    <td className="phone">
-                      <PhoneList
-                        phone={r.phone} // if your row uses `phone`
-                        phone_number={r.phone_number} // if your row uses `phone_number`
-                        phone_numbers={r.phone_numbers} // array if present
-                      />
-                    </td>
-                    <td className="fax">
-                      <FaxList fax={r.fax} fax_numbers={r.fax_numbers} />
-                    </td>
-                    <td>{r.specialty || "-"}</td>
-                    <td>{getMailing(r)}</td>
-                    <td>{getPrimary(r)}</td>
-                    <td>{getSecondary(r)}</td>
-                    {/* Use same 'phone' class to keep number on one line */}
-                    <td className="phone">
-                      {(() => {
-                        const enriched = r.scraped_phone_number || "";
-                        if (!enriched) return "-";
-
-                        // Build a set of known phones from the "Phone" column sources
-                        const phoneA = asArray(r.phone);
-                        const phoneNum = asArray(r.phone_number);
-                        const phoneNums = asArray(r.phone_numbers);
-                        const known = unique([
-                          ...phoneA,
-                          ...phoneNum,
-                          ...phoneNums,
-                        ]);
-                        const knownDigits = new Set(known.map(normalizeDigits));
-
-                        const isDuplicate = knownDigits.has(
-                          normalizeDigits(enriched)
-                        );
-
-                        return (
-                          <span
-                            style={{
-                              color: isDuplicate ? "#dc2626" : undefined,
-                              fontWeight: isDuplicate ? 700 : 400,
-                            }}
-                          >
-                            {enriched}
-                          </span>
-                        );
-                      })()}
-                    </td>
-
-                    <td>
-                      {r.degree || r.degree_year ? (
-                        <>
-                          {r.degree ? <span>{r.degree}</span> : null}
-                          {r.degree_year ? (
-                            <span>
-                              {r.degree ? " • " : ""}
-                              {r.degree_year}
+                      <td className="phone">
+                        <PhoneList
+                          phone={r.phone}
+                          phone_number={r.phone_number}
+                          phone_numbers={r.phone_numbers}
+                        />
+                      </td>
+                      <td className="fax">
+                        <FaxList fax={r.fax} fax_numbers={r.fax_numbers} />
+                      </td>
+                      <td>{r.specialty || "-"}</td>
+                      <td>{getMailing(r)}</td>
+                      <td>{getPrimary(r)}</td>
+                      <td>{getSecondary(r)}</td>
+                      <td className="phone">
+                        {(() => {
+                          const enriched = r.scraped_phone_number || "";
+                          if (!enriched) return "-";
+                          const phoneA = asArray(r.phone);
+                          const phoneNum = asArray(r.phone_number);
+                          const phoneNums = asArray(r.phone_numbers);
+                          const known = unique([
+                            ...phoneA,
+                            ...phoneNum,
+                            ...phoneNums,
+                          ]);
+                          const knownDigits = new Set(
+                            known.map(normalizeDigits)
+                          );
+                          const isDuplicate = knownDigits.has(
+                            normalizeDigits(enriched)
+                          );
+                          return (
+                            <span
+                              style={{
+                                color: isDuplicate ? "#dc2626" : undefined,
+                                fontWeight: isDuplicate ? 700 : 400,
+                              }}
+                            >
+                              {enriched}
                             </span>
-                          ) : null}
-                        </>
-                      ) : (
-                        "-"
-                      )}
-                    </td>
+                          );
+                        })()}
+                      </td>
 
-                    <td>
-                      {r.linkedin_url &&
-                      String(r.linkedin_url)
-                        .toLowerCase()
-                        .includes("linkedin.com") ? (
-                        <a
-                          href={r.linkedin_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="btn btn-secondary btn-sm"
-                        >
-                          Open
-                        </a>
-                      ) : (
-                        "-"
-                      )}
-                    </td>
-                  </tr>
-                ))
+                      <td>
+                        {r.degree || r.degree_year ? (
+                          <>
+                            {r.degree ? <span>{r.degree}</span> : null}
+                            {r.degree_year ? (
+                              <span>
+                                {r.degree ? " • " : ""}
+                                {r.degree_year}
+                              </span>
+                            ) : null}
+                          </>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
+
+                      <td>
+                        {r.linkedin_url &&
+                        String(r.linkedin_url)
+                          .toLowerCase()
+                          .includes("linkedin.com") ? (
+                          <a
+                            href={r.linkedin_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="btn btn-secondary btn-sm"
+                          >
+                            Open
+                          </a>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
               ) : (
                 <tr>
                   <td colSpan={12} style={{ textAlign: "center" }}>
@@ -427,6 +449,34 @@ export default function EnrichmentStep({
               )}
             </tbody>
           </table>
+          {/* pagination for enrichment table */}
+          {rows.length > enrichPageSize && (
+            <div style={{ marginTop: 10 }}>
+              <PaginationControls
+                currentPage={enrichPage}
+                totalPages={enrichTotalPages}
+                onPageChange={(p) => setEnrichPage(p)}
+              />
+              <div style={{ marginTop: 8, textAlign: "center" }}>
+                <label style={{ marginRight: 8 }}>Rows per page:</label>
+                <select
+                  value={enrichPageSize}
+                  onChange={(e) => {
+                    const v = Math.max(
+                      1,
+                      Number(e.target.value) || ENRICH_PAGE_SIZE_DEFAULT
+                    );
+                    setEnrichPageSize(v);
+                    setEnrichPage(0);
+                  }}
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="button-group">

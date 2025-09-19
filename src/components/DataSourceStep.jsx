@@ -6,6 +6,7 @@ import { useLeadFlow } from "../context/LeadFlowContext"; // ✅ context
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
 import { getAuthHeaders, getAuthUser } from "../context/LeadFlowContext";
+import PaginationControls from "./ui/PaginationControls";
 const API_BASE = import.meta.env.VITE_API_BASE;
 
 // -- phone helpers (de-dupe & pretty) --
@@ -125,6 +126,88 @@ const COMPANY_FIELDS = [
   "region",
 ];
 
+// Normalize incoming mapping into canonical shape: { targetField: uploadedColumnName }
+// returns an object with all targets present (value = uploaded header or "")
+function normalizeMappingForEdit(
+  finalMapping = {},
+  uploadedRowsSample = [],
+  dataNature = "person"
+) {
+  // build target set
+  const targets = dataNature === "company" ? COMPANY_FIELDS : PERSON_FIELDS;
+  const targetSet = new Set(targets);
+
+  // if finalMapping already looks like target->uploaded (keys are known targets) just shallow-copy
+  const keys = Object.keys(finalMapping || {});
+  const looksLikeTargetToUploaded =
+    keys.length && keys.every((k) => targetSet.has(k));
+  if (looksLikeTargetToUploaded) {
+    // ensure all targets exist in result
+    const out = {};
+    targets.forEach((t) => {
+      out[t] = finalMapping[t] || "";
+    });
+    return out;
+  }
+
+  // build uploaded headers list (from preview rows)
+  const uploadedHeaders =
+    uploadedRowsSample && uploadedRowsSample.length
+      ? Object.keys(uploadedRowsSample[0])
+      : [];
+  const uploadedLowerToOriginal = new Map(
+    uploadedHeaders.map((h) => [h.toLowerCase(), h])
+  );
+
+  const normalized = {};
+  for (const target of targets) {
+    // default empty
+    let chosen = "";
+
+    // if mapping has a direct key equal to target (server already returned target->uploaded)
+    if (finalMapping && finalMapping[target]) {
+      chosen = finalMapping[target];
+    } else {
+      // try invert: server may have returned uploaded->target, so find a key whose value equals target
+      for (const [k, v] of Object.entries(finalMapping || {})) {
+        if (String(v).toLowerCase() === target.toLowerCase()) {
+          chosen = k; // k is the uploaded column name
+          break;
+        }
+        // or server may have returned key equal to target and value is uploaded already handled above
+      }
+    }
+
+    // if not chosen, try fuzzy match on uploaded headers
+    if (!chosen && uploadedHeaders.length) {
+      const lowerTarget = target.toLowerCase();
+      const candidate = uploadedHeaders.find((h) => {
+        const lh = h.toLowerCase();
+        return (
+          lh.includes(lowerTarget) ||
+          lowerTarget.includes(lh) ||
+          lh.split(/[\s_]/).some((p) => p && lowerTarget.includes(p)) ||
+          lowerTarget.split(/[\s_]/).some((p) => p && lh.includes(p))
+        );
+      });
+      if (candidate) chosen = candidate;
+    }
+
+    // canonicalize chosen to original header casing if we matched by lowercased strings
+    if (
+      chosen &&
+      chosen.toLowerCase &&
+      uploadedLowerToOriginal.has(chosen.toLowerCase())
+    ) {
+      chosen = uploadedLowerToOriginal.get(chosen.toLowerCase());
+    }
+
+    normalized[target] = chosen || "";
+  }
+
+  return normalized;
+}
+
 export default function DataSourceStep({
   sessionId,
   newSessionForFetch,
@@ -155,8 +238,14 @@ export default function DataSourceStep({
   const UPLOAD_PAGE_SIZE = 50;
   const [speciality, setSpeciality] = useState("");
   const [regionScope, setRegionScope] = useState("");
+  // user-selectable fetch limit (default 5000)
+  const [maxResults, setMaxResults] = useState(5000);
+  const MAX_ALLOWED = 50000; // front-end safety limit
   const [uploadTarget, setUploadTarget] = useState("");
   const [primaryKey, setPrimaryKey] = useState("");
+  const [mappingPreviewRows, setMappingPreviewRows] = useState([]);
+  const [parsedPreviewRows, setParsedPreviewRows] = useState([]);
+
   const [specialityPlaceholder, setSpecialityPlaceholder] = useState(
     "Enter specific niche"
   );
@@ -164,16 +253,23 @@ export default function DataSourceStep({
   // Manual-entry state
   const [manualType, setManualType] = useState("Company"); // "Company" | "Healthcare"
   const [manualLoading, setManualLoading] = useState(false);
+  const [uploadedHeaders, setUploadedHeaders] = useState([]); // <-- new
 
   // Company manual form state (keeps existing fields)
   const [manualCompany, setManualCompany] = useState({
     fullName: "",
     email: "",
-    companyName: "",
+    companyName: "", // UI field (mapped to canonical `name`)
+    name: "", // canonical `name` (optional)
     jobTitle: "",
-    linkedIn: "",
+    linkedin_url: "", // canonical linkedin URL
+    linkedIn: "", // legacy UI field (kept for inputs)
     phone: "",
     notes: "",
+    nature_of_company: "", // maps to DB column
+    region: "", // maps to DB column
+    address: "", // maps to DB column
+    website: "", // maps to DB column
   });
 
   // Healthcare manual form state
@@ -200,6 +296,39 @@ export default function DataSourceStep({
 
   // Simple validation errors
   const [manualErrors, setManualErrors] = useState({});
+  // apply target->uploaded mapping to a set of source rows (original uploaded header keys)
+  function applyMappingLocally(mapping, sourceRows, targetFields) {
+    if (!mapping || !sourceRows || !sourceRows.length) return [];
+
+    // mapping: { targetField: uploadedHeaderName }
+    return sourceRows.map((src) => {
+      const out = {};
+      targetFields.forEach((t) => {
+        const uploadedCol = mapping[t] || "";
+        if (
+          uploadedCol &&
+          Object.prototype.hasOwnProperty.call(src, uploadedCol)
+        ) {
+          out[t] = src[uploadedCol];
+        } else {
+          // fallback to if src already had canonical key
+          out[t] = src[t] ?? "";
+        }
+      });
+
+      // keep some legacy keys for UI convenience (name, phone, email) if available
+      out.name =
+        out.name ||
+        (src.first_name && src.last_name
+          ? `${src.first_name} ${src.last_name}`
+          : src.name || "");
+      out.phone = out.phone || src.phone || src.phone_number || "";
+      out.email = out.email || src.email || "";
+      out.session_id = src.session_id || src.sessionId || null;
+      out.mapping_id = src.mapping_id || src.mappingId || null;
+      return out;
+    });
+  }
 
   const specialityHints = {
     SaaS: "e.g., Project Management, CRM Tools, Analytics Platforms",
@@ -215,6 +344,7 @@ export default function DataSourceStep({
   const [totalRows, setTotalRows] = useState(0);
   const [mappingSummary, setMappingSummary] = useState(null);
   const [editingMapping, setEditingMapping] = useState(false);
+  const [mappingSaving, setMappingSaving] = useState(false);
 
   async function handleFileInputChange(e) {
     const authHeaders = getAuthHeaders();
@@ -269,9 +399,20 @@ export default function DataSourceStep({
       headerRow.length === 0 ||
       headerRow.every((h) => !h || /^\d+$/.test(h))
     ) {
-      headerRow = previewRows[0]?.map((_, idx) => `col${idx + 1}`) || [];
+      // determine number of columns robustly:
+      let colCount = 0;
+      if (previewRows && previewRows.length) {
+        const first = previewRows[0];
+        if (Array.isArray(first)) {
+          colCount = first.length;
+        } else if (first && typeof first === "object") {
+          colCount = Object.keys(first).length;
+        }
+      }
+      headerRow = Array.from({ length: colCount }, (_, i) => `col${i + 1}`);
       autoGenerated = true;
     }
+
     // ✅ Ensure previewRows are rebuilt with new headers if auto-generated
     if (autoGenerated) {
       previewRows = previewRows.map((r) =>
@@ -280,6 +421,9 @@ export default function DataSourceStep({
         )
       );
     }
+    // at the end of preview extraction, before sending form:
+    const headersToUse = headerRow.map((h) => h || "").filter(Boolean);
+    setUploadedHeaders(headersToUse);
 
     // Show toast if headers were auto-generated
     if (autoGenerated) {
@@ -291,6 +435,7 @@ export default function DataSourceStep({
     }
 
     // Update preview for UI
+    setParsedPreviewRows(previewRows);
     setUploadedRows(previewRows);
     setFilePreviewVisible(true);
 
@@ -324,65 +469,251 @@ export default function DataSourceStep({
 
     const data = await resp.json();
     console.log("Upload response:", data);
-    setTotalRows(data.original_rows); // or rows_after_deduplication
+
+    // prefer backend preview_data (new); fallback to older unique_data; then fallback to local parsed previewRows
+    const serverRows =
+      data.preview_data || data.unique_data || previewRows || [];
+
+    // total rows count from server (fallback to local length)
+    setTotalRows(data.original_rows ?? serverRows.length);
+
+    // Build sampleRows used for mapping normalization (prefer actual preview rows shown to user)
+    let sampleRows = [];
+    if (previewRows && previewRows.length) {
+      sampleRows = previewRows;
+    } else if (serverRows && serverRows.length) {
+      sampleRows = serverRows;
+    } else if (uploadedHeaders && uploadedHeaders.length) {
+      sampleRows = [Object.fromEntries(uploadedHeaders.map((h) => [h, ""]))];
+    }
+
+    // normalize mapping using server final_mapping (or empty) and the sampleRows
+    const normalized = normalizeMappingForEdit(
+      data.final_mapping || {},
+      sampleRows,
+      uploadTarget || "person"
+    );
+
+    // set mapping summary (keeps session id created at upload)
     setMappingSummary({
-      final_mapping: data.final_mapping,
+      final_mapping: normalized,
       primary_key_used: data.primary_key_used,
+      session_id: sid,
     });
 
-    // ✅ Push dedup stats + source type into context
+    // update flow context — keep serverRows if backend provided preview, otherwise keep local previewRows
     updateFlowData(sid, {
-      uploadedData: data.unique_data, // full data
-      columns: data.columns_detected, // no need to add email forcefully
+      uploadedData: serverRows,
+      columns: data.columns_detected || uploadedHeaders,
+      sourceType: "upload",
+      dataNature: uploadTarget || "person",
+      session_id: sid,
+      mapping_id: data.mapping_id || undefined,
       dedupStats: {
-        total_rows: data.original_rows,
-        unique_rows: data.rows_after_deduplication,
-        duplicates_found: data.duplicates_removed,
-        actions_taken: 0, // silent for upload
+        total_rows: data.original_rows ?? serverRows.length ?? 0,
+        unique_rows: data.rows_after_deduplication ?? serverRows.length ?? 0,
+        duplicates_found: data.duplicates_removed ?? 0,
+        actions_taken: 0,
       },
-      sourceType: "upload", // mark upload vs scraping
     });
 
-    // Show only first 100 rows in preview
-    setUploadedRows(data.unique_data);
+    // Only replace UI preview rows if we actually received server preview rows.
+    // Otherwise keep the local CSV/Excel parsed preview so the table shows data and Edit Mapping stays enabled.
+    if (serverRows && serverRows.length) {
+      setUploadedRows(serverRows);
+    } else if (previewRows && previewRows.length) {
+      setUploadedRows(previewRows);
+    }
     setUploadPage(0);
   }
 
-  async function saveMapping() {
-    const resp = await fetch(`${API_BASE}/remap-columns`, {
-      method: "POST",
-      headers: {
-        ...getAuthHeaders(),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        session_id: sessionId,
-        column_mapping: JSON.stringify(mappingSummary.final_mapping),
-      }),
-    });
-
-    if (!resp.ok) {
-      alert("Failed to update mapping");
-      return;
+  async function saveMapping({ continueAfter = false } = {}) {
+    if (!mappingSummary) {
+      alert("No mapping to save");
+      return false;
     }
-    const data = await resp.json();
-    console.log("Remapped data:", data);
 
-    // update preview rows
-    setUploadedRows(data.remapped_data.slice(0, 100));
+    const uploadedCols =
+      uploadedHeaders && uploadedHeaders.length
+        ? uploadedHeaders
+        : uploadedRows && uploadedRows.length
+        ? Object.keys(uploadedRows[0])
+        : [];
+    const uploadedSet = new Set(uploadedCols.map((c) => String(c)));
 
-    // update flow context BUT do not overwrite stats
-    updateFlowData(sessionId, {
-      uploadedData: data.remapped_data,
-      columns: Object.keys(data.remapped_data[0] || {}),
-    });
+    const sid =
+      mappingSummary.session_id || sessionId || uploadedRows?.[0]?.session_id;
 
-    setMappingSummary((prev) => ({
-      ...prev,
-      final_mapping: data.final_mapping,
-    }));
+    if (!sid) {
+      alert("Session ID missing. Please re-upload or refresh the page.");
+      return false;
+    }
 
-    setEditingMapping(false);
+    const mappingToSend = {};
+    const targets = uploadTarget === "person" ? PERSON_FIELDS : COMPANY_FIELDS;
+    for (const target of targets) {
+      const v = mappingSummary.final_mapping?.[target] || "";
+      // only send if the uploaded column is actually present in original headers
+      mappingToSend[target] = uploadedSet.has(v) ? v : "";
+    }
+
+    try {
+      setMappingSaving(true);
+
+      const resp = await fetch(`${API_BASE}/remap-columns`, {
+        method: "POST",
+        headers: {
+          ...getAuthHeaders(),
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          session_id: sid,
+          column_mapping: JSON.stringify(mappingToSend),
+        }),
+      });
+
+      if (!resp.ok) {
+        const txt = await resp.text();
+        console.error("Remap failed:", txt);
+        alert("Failed to update mapping. See console for details.");
+        return false;
+      }
+
+      const data = await resp.json();
+      console.log("Remapped data:", data);
+
+      // prefer server remapped rows; fall back to local mapped preview or original parsed upload
+      const remappedRows =
+        data.remapped_data && data.remapped_data.length
+          ? data.remapped_data
+          : mappingPreviewRows && mappingPreviewRows.length
+          ? mappingPreviewRows
+          : uploadedRows && uploadedRows.length
+          ? uploadedRows
+          : [];
+
+      // compute dedup stats from server response with sensible fallbacks (use parentheses to ensure correct precedence)
+      const original_rows =
+        (data.rows_before_deduplication ?? null) !== null
+          ? data.rows_before_deduplication
+          : (data.original_rows ?? null) !== null
+          ? data.original_rows
+          : (data.inserted_count ?? null) !== null ||
+            (data.skipped_count ?? null) !== null
+          ? (data.inserted_count ?? 0) + (data.skipped_count ?? 0)
+          : totalRows || remappedRows.length;
+
+      const rows_after_deduplication =
+        (data.rows_after_deduplication ?? null) !== null
+          ? data.rows_after_deduplication
+          : (data.inserted_count ?? null) !== null
+          ? data.inserted_count
+          : remappedRows.length;
+
+      const duplicates_found =
+        (data.duplicates_removed ?? null) !== null
+          ? data.duplicates_removed
+          : Math.max(0, (original_rows || 0) - (rows_after_deduplication || 0));
+
+      const inserted_count = data.inserted_count ?? 0;
+      const skipped_count = data.skipped_count ?? 0;
+
+      // Update UI preview and flow context
+      setUploadedRows(remappedRows);
+      setUploadPage(0);
+
+      // update totalRows state so File Preview footer shows correct numbers
+      if (typeof setTotalRows === "function") {
+        setTotalRows(original_rows || remappedRows.length);
+      }
+
+      const columnsFromServer =
+        data.columns_detected ||
+        data.columns ||
+        (remappedRows && remappedRows[0]
+          ? Object.keys(remappedRows[0])
+          : uploadedCols);
+
+      updateFlowData(sid, {
+        uploadedData: remappedRows,
+        columns: columnsFromServer || uploadedCols,
+        sourceType: "upload",
+        dataNature: uploadTarget || "person",
+        dedupStats: {
+          total_rows: original_rows || remappedRows.length,
+          unique_rows: rows_after_deduplication || remappedRows.length,
+          duplicates_found: duplicates_found,
+          inserted_count,
+          skipped_count,
+          actions_taken: 0,
+        },
+      });
+
+      // normalize returned mapping (server might return different shape)
+      const normalizedReturned = normalizeMappingForEdit(
+        data.final_mapping || mappingSummary.final_mapping || {},
+        remappedRows.length
+          ? remappedRows
+          : uploadedRows.length
+          ? uploadedRows
+          : [],
+        uploadTarget || "person"
+      );
+
+      setMappingSummary((prev) => ({
+        ...prev,
+        final_mapping: normalizedReturned,
+        // ensure we keep session id
+        session_id: prev?.session_id || sid,
+        dedupStats: {
+          total_rows: original_rows || remappedRows.length,
+          unique_rows: rows_after_deduplication || remappedRows.length,
+          duplicates_found,
+          inserted_count,
+          skipped_count,
+        },
+      }));
+
+      // update the local mapping preview rows (so editing view remains consistent)
+      const targetsArray =
+        uploadTarget === "person" ? PERSON_FIELDS : COMPANY_FIELDS;
+      const localPreview = applyMappingLocally(
+        normalizedReturned,
+        uploadedRows && uploadedRows.length ? uploadedRows : remappedRows,
+        targetsArray
+      );
+      setMappingPreviewRows(localPreview);
+
+      setEditingMapping(false);
+
+      // if requested, proceed to next step (small delay so UI updates first)
+      if (continueAfter) {
+        setTimeout(() => nextStep(), 120);
+      }
+
+      return true;
+    } catch (err) {
+      console.error("saveMapping error:", err);
+      alert("Failed to save mapping: " + (err.message || err));
+      return false;
+    } finally {
+      setMappingSaving(false);
+    }
+  }
+
+  // Called when user clicks top-level Continue button (non-manual flows)
+  async function handleContinueClick() {
+    if (selectedSource === "upload") {
+      // confirm mapping and insert canonical rows into staging via remap-columns endpoint
+      const ok = await saveMapping({ continueAfter: true });
+      if (!ok) {
+        // keep the user on the same page so they can retry
+        return;
+      }
+    } else {
+      // preserve original behavior for scraping and others
+      nextStep();
+    }
   }
 
   function recomputeIsNPI() {
@@ -404,6 +735,38 @@ export default function DataSourceStep({
       return () => clearTimeout(timer);
     }
   }, [headerWarning]);
+  useEffect(() => {
+    if (!mappingSummary) {
+      setMappingPreviewRows([]);
+      return;
+    }
+
+    // base rows to remap: prefer the locally parsed preview (parsedPreviewRows) if available,
+    // otherwise fall back to server-preview/unique rows in uploadedRows
+    const baseRows =
+      parsedPreviewRows && parsedPreviewRows.length
+        ? parsedPreviewRows
+        : uploadedRows && uploadedRows.length
+        ? uploadedRows
+        : [];
+
+    if (!baseRows || baseRows.length === 0) {
+      setMappingPreviewRows([]);
+      return;
+    }
+
+    const targets = uploadTarget === "person" ? PERSON_FIELDS : COMPANY_FIELDS;
+    // compute mapping -> use mappingSummary.final_mapping (user edits update this)
+    const mapping = mappingSummary?.final_mapping || {};
+    const mapped = applyMappingLocally(mapping, baseRows, targets);
+    setMappingPreviewRows(mapped);
+  }, [
+    mappingSummary?.final_mapping,
+    editingMapping,
+    uploadedRows,
+    parsedPreviewRows, // <- use this instead of previewRows
+    uploadTarget,
+  ]);
 
   function gatherScrapeFormValues() {
     const geography =
@@ -440,10 +803,22 @@ export default function DataSourceStep({
     Math.ceil(scrapeResults.length / SCRAPE_PAGE_SIZE)
   );
 
-  const pagedUploadRows = (uploadedRows || []).slice(
+  // pick which rows to display in the preview table
+  const displayRows = editingMapping
+    ? mappingPreviewRows || []
+    : uploadedRows || [];
+  const pagedDisplayRows = (displayRows || []).slice(
     uploadPage * UPLOAD_PAGE_SIZE,
     (uploadPage + 1) * UPLOAD_PAGE_SIZE
   );
+  const displayTotal = (displayRows || []).length || totalRows;
+  const displayColumns =
+    editingMapping && mappingPreviewRows && mappingPreviewRows[0]
+      ? Object.keys(mappingPreviewRows[0])
+      : uploadedRows && uploadedRows[0]
+      ? Object.keys(uploadedRows[0])
+      : uploadedHeaders;
+
   const uploadTotalPages = Math.max(
     1,
     Math.ceil((uploadedRows || []).length / UPLOAD_PAGE_SIZE)
@@ -580,22 +955,39 @@ export default function DataSourceStep({
                 email: manualHealth.email,
               }
             : {
-                fullName: manualCompany.fullName,
-                email: manualCompany.email,
-                companyName: manualCompany.companyName,
-                jobTitle: manualCompany.jobTitle,
-                linkedIn: manualCompany.linkedIn,
-                phone: manualCompany.phone,
-                notes: manualCompany.notes,
+                // Canonical company payload expected by backend
+                name:
+                  manualCompany.companyName ||
+                  manualCompany.name ||
+                  manualCompany.fullName ||
+                  "",
+                nature_of_company: manualCompany.nature_of_company || "",
+                region: manualCompany.region || "",
+                address: manualCompany.address || "",
+                phone: manualCompany.phone || "",
+                email: manualCompany.email || "",
+                website: manualCompany.website || "",
+                linkedin_url:
+                  manualCompany.linkedin_url || manualCompany.linkedIn || "",
+                // preserve jobTitle/notes in scraped_data JSON so backend can keep them
+                scraped_data: {
+                  jobTitle: manualCompany.jobTitle || "",
+                  notes: manualCompany.notes || "",
+                },
               },
       };
 
+      const headers = {
+        "Content-Type": "application/json",
+        ...getAuthHeaders(),
+      };
+      if (srcUser) {
+        headers["X-User-Id"] = String(srcUser); // backend reads X-User-Id
+      }
+
       const resp = await fetch(`${API_BASE}/manual-entry`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...getAuthHeaders(),
-        },
+        headers,
         body: JSON.stringify(payload),
       });
 
@@ -643,6 +1035,12 @@ export default function DataSourceStep({
               },
             ];
 
+      // decide canonical data nature ('person' | 'company')
+      const dataNature =
+        String(manualType).toLowerCase() === "healthcare"
+          ? "person"
+          : "company";
+
       updateFlowData(sid, {
         uploadedData,
         columns: Object.keys(uploadedData[0] || {}),
@@ -654,12 +1052,19 @@ export default function DataSourceStep({
         },
         sourceType: "manual",
         sourceSubtype: manualType === "Healthcare" ? "healthcare" : "company",
-        skipDedup: manualType === "Healthcare" ? true : false,
+        // skip dedup/enrichment for companies (we go straight to Review)
+        skipDedup: dataNature === "company",
+        // IMPORTANT: tell the parent whether this session contains person or company rows
+        dataNature,
         mapping_id: mappingId,
       });
 
-      // Navigate to next step. Parent should read skipDedup and route to enrichment.
-      nextStep();
+      // ✅ Company → skip dedup & enrichment → go straight to Review
+      if (manualType === "Company") {
+        nextStep("review");
+      } else {
+        nextStep();
+      }
     } catch (err) {
       console.error("Manual entry failed:", err);
       alert("Failed to save manual entry: " + (err.message || err));
@@ -715,7 +1120,10 @@ export default function DataSourceStep({
           body: JSON.stringify({
             region: regionScope,
             specialty: speciality,
-            session_id: sid, // ✅ passed from parent
+            session_id: sid,
+            max_results: Number(maxResults) || 5000,
+            // optional: include authenticated user id if your backend accepts it:
+            // source_user_id: auth?.user_id
           }),
         });
 
@@ -1067,16 +1475,63 @@ export default function DataSourceStep({
           )}
 
           {/* Fetch Leads button */}
-          <div style={{ marginTop: 20 }}>
-            <button
-              className="btn btn-primary"
-              onClick={handleStartScraping}
-              disabled={scrapeLoading}
-            >
-              {scrapeLoading
-                ? "⏳ Fetching leads..."
-                : "🚀 Fetch Leads (Top 50)"}
-            </button>
+          <div
+            style={{
+              marginTop: 20,
+              display: "flex",
+              gap: 12,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <label style={{ fontWeight: 600 }}>Fetch</label>
+              {/* suggestions: 100, 500, 1000, 5000 */}
+              <input
+                type="number"
+                min={1}
+                max={MAX_ALLOWED}
+                step={1}
+                value={maxResults}
+                onChange={(e) => {
+                  const v = Number(e.target.value) || 0;
+                  // clamp for safety
+                  const clamp = Math.max(
+                    1,
+                    Math.min(MAX_ALLOWED, Math.floor(v))
+                  );
+                  setMaxResults(clamp);
+                }}
+                style={{
+                  width: 120,
+                  padding: "8px 10px",
+                  borderRadius: 6,
+                  border: "1px solid #e5e7eb",
+                }}
+                list="fetch-suggestions"
+                aria-label="Number of rows to fetch"
+              />
+              <datalist id="fetch-suggestions">
+                <option value="100" />
+                <option value="500" />
+                <option value="1000" />
+                <option value="5000" />
+              </datalist>
+              <span style={{ color: "#6b7280" }}>rows (type custom value)</span>
+            </div>
+
+            <div>
+              <button
+                className="btn btn-primary"
+                onClick={handleStartScraping}
+                disabled={scrapeLoading}
+                title="Fetch leads from chosen source"
+              >
+                {scrapeLoading
+                  ? `⏳ Fetching leads (${maxResults})...`
+                  : `🚀 Fetch Leads (${maxResults})`}
+              </button>
+            </div>
           </div>
 
           {/* Scrape Results */}
@@ -1176,39 +1631,6 @@ export default function DataSourceStep({
                     );
                   })}
                 </tbody>
-                {/* Scrape pagination controls */}
-                {scrapeResults.length > SCRAPE_PAGE_SIZE && (
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "center",
-                      gap: 12,
-                      marginTop: 10,
-                    }}
-                  >
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => setScrapePage((p) => Math.max(0, p - 1))}
-                      disabled={scrapePage <= 0}
-                    >
-                      ← Previous
-                    </button>
-                    <div style={{ alignSelf: "center" }}>
-                      Page {scrapePage + 1} of {scrapeTotalPages}
-                    </div>
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      onClick={() =>
-                        setScrapePage((p) =>
-                          Math.min(scrapeTotalPages - 1, p + 1)
-                        )
-                      }
-                      disabled={scrapePage >= scrapeTotalPages - 1}
-                    >
-                      Next →
-                    </button>
-                  </div>
-                )}
               </table>
             ) : scrapeLoading ? (
               <p>⏳ Fetching leads...</p>
@@ -1218,6 +1640,14 @@ export default function DataSourceStep({
               <p>No results yet.</p>
             )}
           </div>
+          {/* Scrape pagination controls */}
+          {scrapeResults.length > SCRAPE_PAGE_SIZE && (
+            <PaginationControls
+              currentPage={scrapePage}
+              totalPages={scrapeTotalPages}
+              onPageChange={(p) => setScrapePage(p)}
+            />
+          )}
         </div>
 
         {/* Upload Form */}
@@ -1307,19 +1737,17 @@ export default function DataSourceStep({
               <table className="data-table">
                 <thead>
                   <tr>
-                    {uploadedRows && uploadedRows.length > 0
-                      ? Object.keys(uploadedRows[0]).map((col, i) => (
-                          <th key={i}>{col}</th>
-                        ))
+                    {displayColumns && displayColumns.length > 0
+                      ? displayColumns.map((col, i) => <th key={i}>{col}</th>)
                       : null}
                   </tr>
                 </thead>
                 <tbody>
-                  {uploadedRows && uploadedRows.length > 0
-                    ? pagedUploadRows.map((row, i) => (
+                  {pagedDisplayRows && pagedDisplayRows.length > 0
+                    ? pagedDisplayRows.map((row, i) => (
                         <tr key={uploadPage * UPLOAD_PAGE_SIZE + i}>
-                          {Object.values(row).map((val, j) => (
-                            <td key={j}>{val}</td>
+                          {displayColumns.map((col, j) => (
+                            <td key={j}>{row[col] ?? ""}</td>
                           ))}
                         </tr>
                       ))
@@ -1336,27 +1764,11 @@ export default function DataSourceStep({
                     marginTop: 10,
                   }}
                 >
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => setUploadPage((p) => Math.max(0, p - 1))}
-                    disabled={uploadPage <= 0}
-                  >
-                    ← Previous
-                  </button>
-                  <div style={{ alignSelf: "center" }}>
-                    Page {uploadPage + 1} of {uploadTotalPages}
-                  </div>
-                  <button
-                    className="btn btn-secondary btn-sm"
-                    onClick={() =>
-                      setUploadPage((p) =>
-                        Math.min(uploadTotalPages - 1, p + 1)
-                      )
-                    }
-                    disabled={uploadPage >= uploadTotalPages - 1}
-                  >
-                    Next →
-                  </button>
+                  <PaginationControls
+                    currentPage={uploadPage}
+                    totalPages={uploadTotalPages}
+                    onPageChange={(p) => setUploadPage(p)}
+                  />
                 </div>
               )}
 
@@ -1368,8 +1780,15 @@ export default function DataSourceStep({
                   fontStyle: "italic",
                 }}
               >
-                Showing first {Math.min(50, uploadedRows.length)} of {totalRows}{" "}
-                rows. All rows are stored in the database.
+                Showing{" "}
+                {uploadedRows && uploadedRows.length
+                  ? `${uploadPage * UPLOAD_PAGE_SIZE + 1}–${Math.min(
+                      (uploadPage + 1) * UPLOAD_PAGE_SIZE,
+                      uploadedRows.length
+                    )}`
+                  : "0"}{" "}
+                of {totalRows} rows. All rows are saved as draft mappings —
+                confirm mapping to insert into staging.
               </p>
             </div>
           )}
@@ -1402,6 +1821,9 @@ export default function DataSourceStep({
             className="btn btn-secondary btn-sm"
             style={{ marginTop: "8px" }}
             onClick={() => setEditingMapping(true)}
+            disabled={
+              !uploadedRows || uploadedRows.length === 0 || !mappingSummary
+            }
           >
             ✏️ Edit Mapping
           </button>
@@ -1409,8 +1831,11 @@ export default function DataSourceStep({
           {editingMapping && (
             <div style={{ marginTop: "1rem" }}>
               <h4>Adjust Column Mapping</h4>
-              {(uploadTarget === "person" ? PERSON_FIELDS : COMPANY_FIELDS).map(
-                (target) => (
+              {mappingSummary &&
+                (uploadTarget === "person"
+                  ? PERSON_FIELDS
+                  : COMPANY_FIELDS
+                ).map((target) => (
                   <div key={target} className="form-group">
                     <label>{target}</label>
                     <select
@@ -1427,15 +1852,21 @@ export default function DataSourceStep({
                       }
                     >
                       <option value="">-- not mapped --</option>
-                      {Object.keys(uploadedRows[0] || {}).map((col) => (
-                        <option key={col} value={col}>
-                          {col}
-                        </option>
-                      ))}
+                      {uploadedHeaders.length
+                        ? uploadedHeaders.map((col) => (
+                            <option key={col} value={col}>
+                              {col}
+                            </option>
+                          ))
+                        : // fallback to nothing or existing uploadedRows keys
+                          Object.keys(uploadedRows[0] || {}).map((col) => (
+                            <option key={col} value={col}>
+                              {col}
+                            </option>
+                          ))}
                     </select>
                   </div>
-                )
-              )}
+                ))}
 
               <button
                 className="btn btn-primary btn-sm"
@@ -1515,16 +1946,70 @@ export default function DataSourceStep({
             <>
               <div className="form-grid">
                 <div className="form-group">
-                  <label className="form-label">Full Name</label>
+                  <label className="form-label">Company Name</label>
                   <input
-                    name="fullName"
+                    name="companyName"
                     type="text"
                     className="form-input"
-                    placeholder="Enter full name"
-                    value={manualCompany.fullName}
+                    placeholder="Enter company name"
+                    value={manualCompany.companyName}
+                    onChange={onChangeManualCompany}
+                  />
+                  {manualErrors.companyName && (
+                    <div style={{ color: "red", marginTop: 6 }}>
+                      {manualErrors.companyName}
+                    </div>
+                  )}
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Nature / Industry</label>
+                  <input
+                    name="nature_of_company"
+                    type="text"
+                    className="form-input"
+                    placeholder="e.g., Education, Healthcare, SaaS"
+                    value={manualCompany.nature_of_company}
                     onChange={onChangeManualCompany}
                   />
                 </div>
+
+                <div className="form-group">
+                  <label className="form-label">Region</label>
+                  <input
+                    name="region"
+                    type="text"
+                    className="form-input"
+                    placeholder="Country / Region"
+                    value={manualCompany.region}
+                    onChange={onChangeManualCompany}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Address</label>
+                  <input
+                    name="address"
+                    type="text"
+                    className="form-input"
+                    placeholder="Enter address"
+                    value={manualCompany.address}
+                    onChange={onChangeManualCompany}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Website</label>
+                  <input
+                    name="website"
+                    type="url"
+                    className="form-input"
+                    placeholder="https://example.com"
+                    value={manualCompany.website}
+                    onChange={onChangeManualCompany}
+                  />
+                </div>
+
                 <div className="form-group">
                   <label className="form-label">Email Address</label>
                   <input
@@ -1536,39 +2021,7 @@ export default function DataSourceStep({
                     onChange={onChangeManualCompany}
                   />
                 </div>
-                <div className="form-group">
-                  <label className="form-label">Company Name</label>
-                  <input
-                    name="companyName"
-                    type="text"
-                    className="form-input"
-                    placeholder="Enter company name"
-                    value={manualCompany.companyName}
-                    onChange={onChangeManualCompany}
-                  />
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Job Title</label>
-                  <input
-                    name="jobTitle"
-                    type="text"
-                    className="form-input"
-                    placeholder="Enter job title"
-                    value={manualCompany.jobTitle}
-                    onChange={onChangeManualCompany}
-                  />
-                </div>
-                <div className="form-group">
-                  <label className="form-label">LinkedIn Profile</label>
-                  <input
-                    name="linkedIn"
-                    type="url"
-                    className="form-input"
-                    placeholder="https://linkedin.com/in/profile"
-                    value={manualCompany.linkedIn}
-                    onChange={onChangeManualCompany}
-                  />
-                </div>
+
                 <div className="form-group">
                   <label className="form-label">Phone Number (Optional)</label>
                   <input
@@ -1580,7 +2033,32 @@ export default function DataSourceStep({
                     onChange={onChangeManualCompany}
                   />
                 </div>
+
+                <div className="form-group">
+                  <label className="form-label">LinkedIn Profile</label>
+                  <input
+                    name="linkedin_url"
+                    type="url"
+                    className="form-input"
+                    placeholder="https://linkedin.com/company/..."
+                    value={manualCompany.linkedin_url || manualCompany.linkedIn}
+                    onChange={onChangeManualCompany}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Job Title (optional)</label>
+                  <input
+                    name="jobTitle"
+                    type="text"
+                    className="form-input"
+                    placeholder="Enter job title (optional)"
+                    value={manualCompany.jobTitle}
+                    onChange={onChangeManualCompany}
+                  />
+                </div>
               </div>
+
               <div className="form-group">
                 <label className="form-label">Notes (Optional)</label>
                 <textarea
@@ -1731,12 +2209,23 @@ export default function DataSourceStep({
           <button
             className="btn btn-primary btn-large"
             onClick={
-              selectedSource === "manual" ? handleManualContinue : nextStep
+              selectedSource === "manual"
+                ? handleManualContinue
+                : selectedSource === "upload"
+                ? handleContinueClick
+                : nextStep
             }
-            disabled={selectedSource === "manual" && manualLoading}
+            disabled={
+              (selectedSource === "manual" && manualLoading) ||
+              (selectedSource === "upload" && mappingSaving)
+            }
           >
             {selectedSource === "manual" && manualLoading
               ? "Saving…"
+              : selectedSource === "upload" && mappingSaving
+              ? "Saving mapping…"
+              : selectedSource === "manual" && manualType === "Company"
+              ? "Continue to Review"
               : "Continue to Duplication"}
             <span> →</span>
           </button>

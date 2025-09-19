@@ -6,11 +6,13 @@ import StepSection from "./StepSection";
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
 import { useLeadFlow } from "../context/LeadFlowContext";
+import PaginationControls from "./ui/PaginationControls";
 const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
   const { flowData } = useLeadFlow();
   const sessionData = flowData[sessionId] || {};
+  const DEDUP_PAGE_SIZE_DEFAULT = 50;
   const precomputedStats = sessionData.dedupStats;
   const sourceType = sessionData.sourceType;
   const [rows, setRows] = useState([]);
@@ -18,6 +20,18 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
   // optimistic state
   const [localActions, setLocalActions] = useState({}); // key -> "KEEP" | "DISCARD"
   const [pending, setPending] = useState({}); // key -> boolean
+  // frontend pagination for deduplication table
+  const [dedupPage, setDedupPage] = useState(0);
+  const [dedupPageSize, setDedupPageSize] = useState(DEDUP_PAGE_SIZE_DEFAULT);
+
+  const dedupTotalPages = Math.max(
+    1,
+    Math.ceil((rows?.length || 0) / dedupPageSize)
+  );
+  const pagedRows = (rows || []).slice(
+    dedupPage * dedupPageSize,
+    (dedupPage + 1) * dedupPageSize
+  );
 
   // ------------ helpers (same address formatting as DataSourceStep) ------------
   const rowKey = (r, idx) => {
@@ -53,6 +67,18 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
       }
     }
     return v;
+  };
+
+  // navigation handler: if company -> go to review, otherwise go to enrichment
+  const handleContinue = () => {
+    const nature = sessionData.dataNature || "person";
+    if (nature === "company") {
+      // go to review screen
+      nextStep("review");
+    } else {
+      // go to enrichment screen
+      nextStep("enrichment");
+    }
   };
 
   const formatAddress = (addr) => {
@@ -116,6 +142,14 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
   useEffect(() => {
     fetchDedup();
   }, [fetchDedup]);
+
+  useEffect(() => {
+    setDedupPage(0);
+  }, [rows]);
+
+  useEffect(() => {
+    setDedupPage(0);
+  }, [rows, dedupPageSize]);
 
   // ------------ duplicate metadata (by NPI) ------------
   const { duplicateSet, firstIndexByNPI } = useMemo(() => {
@@ -326,11 +360,16 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
             <thead>
               <tr>
                 {sourceType === "upload" && sessionData.columns ? (
+                  // Render headers in exact order provided by backend (sessionData.columns)
                   <>
-                    {preferredOrder.map((col) => {
-                      if (col === "name") return <th key="name">Name</th>;
-                      if (col === "phone_number")
-                        return <th key="phone_number">Phone Number</th>;
+                    {sessionData.columns.map((col) => {
+                      // If CSV provided first_name + last_name we show a single "Name" header
+                      if (col === "first_name") return <th key="name">Name</th>;
+                      if (col === "last_name") return null; // skip separate last_name header
+
+                      // Friendly label for known special columns
+                      if (col === "phone" || col === "phone_number")
+                        return <th key={col}>Phone</th>;
                       if (col === "fax") return <th key="fax">Fax</th>;
                       if (col === "mailing_address")
                         return <th key="mailing_address">Mailing Address</th>;
@@ -340,37 +379,19 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                         return (
                           <th key="secondary_address">Secondary Address</th>
                         );
-                      if (sessionData.columns.includes(col)) {
-                        return (
-                          <th key={col}>
-                            {col
-                              .replace(/_/g, " ")
-                              .replace(/\b\w/g, (c) => c.toUpperCase())}
-                          </th>
-                        );
-                      }
-                      return null;
+
+                      // Default label: replace underscores and title-case words
+                      const label = col
+                        .replace(/_/g, " ")
+                        .replace(/\b\w/g, (c) => c.toUpperCase());
+                      return <th key={col}>{label}</th>;
                     })}
 
-                    {/* Extra unmapped columns */}
-                    {sessionData.columns
-                      .filter(
-                        (col) =>
-                          !preferredOrder.includes(col) &&
-                          col !== "first_name" &&
-                          col !== "last_name" &&
-                          col !== "phone_number" &&
-                          col !== "fax"
-                      )
-                      .map((col) => (
-                        <th key={col}>
-                          {col
-                            .replace(/_/g, " ")
-                            .replace(/\b\w/g, (c) => c.toUpperCase())}
-                        </th>
-                      ))}
+                    {/* Optionally add Action column header if dedup actions are needed */}
+                    {showActionColumn && <th key="action">Action</th>}
                   </>
                 ) : (sessionData.dataNature || "person") === "person" ? (
+                  // person default header (unchanged)
                   <>
                     <th>NPI</th>
                     <th>Name</th>
@@ -384,6 +405,7 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                     {showActionColumn && <th>Action</th>}
                   </>
                 ) : (
+                  // company default header (unchanged)
                   <>
                     <th>Name</th>
                     <th>Email</th>
@@ -403,7 +425,8 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                   <td
                     colSpan={
                       sourceType === "upload"
-                        ? sessionData.columns?.length || 1
+                        ? (sessionData.columns?.length || 1) +
+                          (showActionColumn ? 1 : 0)
                         : showActionColumn
                         ? 10
                         : 9
@@ -415,77 +438,111 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                 </tr>
               ) : rows.length ? (
                 sourceType === "upload" && sessionData.columns ? (
-                  rows.map((row, i) => (
-                    <tr key={i}>
-                      {preferredOrder.map((col) => {
-                        if (col === "name") {
-                          return (
-                            <td key="name">
-                              {[row.first_name, row.last_name]
+                  // Render upload rows using the exact column order provided by sessionData.columns
+                  pagedRows.map((row, i) => {
+                    // compute global index used by existing functions
+                    const idx = dedupPage * dedupPageSize + i;
+                    const key = rowKey(row, idx);
+                    const dupLater = isLaterDuplicate(row, idx);
+                    const act = effectiveAction(row, idx);
+                    const isPending = !!pending[key];
+
+                    return (
+                      <tr key={key} style={rowStyle(row, idx)}>
+                        {sessionData.columns.map((col) => {
+                          // when using row values, keep using `row` (the row object), but pass `idx` to helper calls
+                          if (col === "first_name") {
+                            const combined =
+                              [row.first_name, row.last_name]
                                 .filter(Boolean)
                                 .join(" ") ||
-                                row.name ||
-                                "-"}
-                            </td>
-                          );
-                        }
-                        if (col === "phone_number") {
-                          return (
-                            <td key="phone_number">
-                              <PhoneList
-                                phone={row.phone}
-                                phone_number={row.phone_number}
-                                phone_numbers={row.phone_numbers}
-                              />
-                            </td>
-                          );
-                        }
-                        if (col === "fax") {
-                          return (
-                            <td key="fax">
-                              <FaxList
-                                fax={row.fax}
-                                fax_numbers={row.fax_numbers}
-                              />
-                            </td>
-                          );
-                        }
-                        if (col === "mailing_address")
-                          return (
-                            <td key="mailing_address">{getMailing(row)}</td>
-                          );
-                        if (col === "primary_address")
-                          return (
-                            <td key="primary_address">{getPrimary(row)}</td>
-                          );
-                        if (col === "secondary_address")
-                          return (
-                            <td key="secondary_address">{getSecondary(row)}</td>
-                          );
+                              row.name ||
+                              "-";
+                            return <td key="name">{combined}</td>;
+                          }
+                          if (col === "last_name") return null;
+                          if (col === "name") {
+                            return (
+                              <td key="name">
+                                {row.name ||
+                                  [row.first_name, row.last_name]
+                                    .filter(Boolean)
+                                    .join(" ") ||
+                                  "-"}
+                              </td>
+                            );
+                          }
+                          if (col === "phone" || col === "phone_number") {
+                            return (
+                              <td key={col} className="phone">
+                                <PhoneList
+                                  phone={row.phone}
+                                  phone_number={row.phone_number}
+                                  phone_numbers={row.phone_numbers}
+                                />
+                              </td>
+                            );
+                          }
+                          if (col === "fax") {
+                            return (
+                              <td key="fax" className="fax">
+                                <FaxList
+                                  fax={row.fax}
+                                  fax_numbers={row.fax_numbers}
+                                />
+                              </td>
+                            );
+                          }
+                          if (col === "mailing_address") {
+                            return (
+                              <td key="mailing_address">{getMailing(row)}</td>
+                            );
+                          }
+                          if (col === "primary_address") {
+                            return (
+                              <td key="primary_address">{getPrimary(row)}</td>
+                            );
+                          }
+                          if (col === "secondary_address") {
+                            return (
+                              <td key="secondary_address">
+                                {getSecondary(row)}
+                              </td>
+                            );
+                          }
+                          return <td key={col}>{row[col] ?? "-"}</td>;
+                        })}
 
-                        if (sessionData.columns.includes(col)) {
-                          return <td key={col}>{row[col] || "-"}</td>;
-                        }
-                        return null;
-                      })}
-
-                      {/* Extra unmapped columns */}
-                      {sessionData.columns
-                        .filter(
-                          (col) =>
-                            !preferredOrder.includes(col) &&
-                            col !== "first_name" &&
-                            col !== "last_name" &&
-                            col !== "phone_number" &&
-                            col !== "fax"
-                        )
-                        .map((col) => (
-                          <td key={col}>{row[col] || "-"}</td>
-                        ))}
-                    </tr>
-                  ))
+                        {showActionColumn && (
+                          <td>
+                            {dupLater && !act ? (
+                              <>
+                                <button
+                                  className="btn btn-primary btn-sm"
+                                  onClick={() => handleKeep(row, idx)}
+                                  disabled={isPending}
+                                >
+                                  {isPending ? "Keeping…" : "Keep"}
+                                </button>
+                                <button
+                                  className="btn btn-secondary btn-sm"
+                                  style={{ marginLeft: "0.5rem" }}
+                                  onClick={() => handleDiscard(row, idx)}
+                                  disabled={isPending}
+                                >
+                                  {isPending ? "Discarding…" : "Discard"}
+                                </button>
+                              </>
+                            ) : null}
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })
                 ) : (
-                  rows.map((r, idx) => {
+                  // existing non-upload rendering (person/company dedup mode)
+                  pagedRows.map((r, i) => {
+                    const idx = dedupPage * dedupPageSize + i; // compute global index
                     const key = rowKey(r, idx);
                     const dupLater = isLaterDuplicate(r, idx);
                     const act = effectiveAction(r, idx);
@@ -561,7 +618,8 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
                   <td
                     colSpan={
                       sourceType === "upload"
-                        ? sessionData.columns?.length || 1
+                        ? (sessionData.columns?.length || 1) +
+                          (showActionColumn ? 1 : 0)
                         : showActionColumn
                         ? 10
                         : 9
@@ -574,14 +632,49 @@ export default function DeduplicationStep({ prevStep, nextStep, sessionId }) {
               )}
             </tbody>
           </table>
+          {/* pagination controls for dedup table */}
+          {rows.length > dedupPageSize && (
+            <div style={{ marginTop: 10 }}>
+              <PaginationControls
+                currentPage={dedupPage}
+                totalPages={dedupTotalPages}
+                onPageChange={(p) => setDedupPage(p)}
+              />
+              {/* optional: a page-size selector */}
+              <div style={{ marginTop: 8, textAlign: "center" }}>
+                <label style={{ marginRight: 8 }}>Rows per page:</label>
+                <select
+                  value={dedupPageSize}
+                  onChange={(e) => {
+                    const v = Math.max(
+                      1,
+                      Number(e.target.value) || DEDUP_PAGE_SIZE_DEFAULT
+                    );
+                    setDedupPageSize(v);
+                    setDedupPage(0); // reset to first page after changing size
+                  }}
+                >
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                </select>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="button-group">
           <button className="btn btn-secondary btn-large" onClick={prevStep}>
             ← Previous Step
           </button>
-          <button className="btn btn-primary btn-large" onClick={nextStep}>
-            Continue to Enrichment <span>→</span>
+          <button
+            className="btn btn-primary btn-large"
+            onClick={handleContinue}
+          >
+            {sessionData.dataNature === "company"
+              ? "Continue to Review "
+              : "Continue to Enrichment "}
+            <span>→</span>
           </button>
         </div>
       </div>
