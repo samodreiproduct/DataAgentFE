@@ -1,11 +1,18 @@
 // =======================================
 // File: src/components/EnrichmentStep.jsx
 // =======================================
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, {
+  useEffect,
+  useMemo,
+  useState,
+  useCallback,
+  useRef,
+} from "react";
 import StepSection from "./StepSection";
 import PhoneList from "../reusableComponents/PhoneList";
 import FaxList from "../reusableComponents/FaxList";
 import PaginationControls from "./ui/PaginationControls";
+import { getAuthHeaders, getAuthUser } from "../context/LeadFlowContext";
 const API_BASE = import.meta.env.VITE_API_BASE;
 
 export default function EnrichmentStep({
@@ -19,6 +26,18 @@ export default function EnrichmentStep({
   const [running, setRunning] = useState(false);
   const [lastRun, setLastRun] = useState(null);
   const [hasRun, setHasRun] = useState(false); // ← gate “Successfully Enriched” until user runs
+
+  // Polling / progress states
+  const [enqueuedCount, setEnqueuedCount] = useState(null);
+  const [polling, setPolling] = useState(false);
+  const pollRef = useRef(null);
+  const pollAttemptsRef = useRef(0);
+  const prevDoneRef = useRef(null);
+
+  // Tune these as needed for large jobs
+  const POLL_INTERVAL_MS = 5000;
+  const POLL_MAX_ATTEMPTS = 120; // ~10 minutes safety cap; raise for larger jobs
+
   // frontend pagination
   const ENRICH_PAGE_SIZE_DEFAULT = 50;
   const [enrichPage, setEnrichPage] = useState(0);
@@ -106,30 +125,59 @@ export default function EnrichmentStep({
   const getPrimary = (r) => formatAddress(safeJson(r.primary_address));
   const getSecondary = (r) => formatAddress(safeJson(r.secondary_address));
 
-  // ---------- fetch ----------
-  const fetchEnrichment = useCallback(async () => {
-    if (!sessionId) return;
-    setLoading(true);
-    try {
-      const res = await fetch(
-        `${API_BASE}/enrichment?session_id=${encodeURIComponent(sessionId)}`
-      );
-      const data = await res.json();
-      if (data?.status === "success") {
-        setRows(Array.isArray(data.rows) ? data.rows : []);
-      } else {
-        setRows([]);
+  // ---------- fetch full rows (improved: abortable + check resp.ok) ----------
+  const fetchEnrichment = useCallback(
+    async (opts = {}) => {
+      if (!sessionId) return;
+      const { signal } = opts;
+      setLoading(true);
+      try {
+        const res = await fetch(
+          `${API_BASE}/enrichment?session_id=${encodeURIComponent(sessionId)}`,
+          { signal, headers: getAuthHeaders() }
+        );
+
+        if (!res.ok) {
+          // server returned non-2xx
+          console.error(
+            "fetchEnrichment HTTP error",
+            res.status,
+            res.statusText
+          );
+          setRows([]);
+          return;
+        }
+
+        const data = await res.json().catch((e) => {
+          console.error("fetchEnrichment json parse error:", e);
+          return null;
+        });
+
+        if (Array.isArray(data?.rows)) {
+          setRows(data.rows);
+        } else if (Array.isArray(data)) {
+          // defensive: some endpoints return raw array
+          setRows(data);
+        } else {
+          setRows([]);
+        }
+      } catch (e) {
+        if (e.name === "AbortError") {
+          // fetch was cancelled — quietly ignore
+        } else {
+          console.error("Error fetching enrichment list:", e);
+          setRows([]);
+        }
+      } finally {
+        setLoading(false);
       }
-    } catch (e) {
-      console.error("Error fetching enrichment list:", e);
-      setRows([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [sessionId]);
+    },
+    [sessionId]
+  );
 
   useEffect(() => {
     fetchEnrichment();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchEnrichment]);
 
   // reset to first page when rows or page-size change
@@ -140,30 +188,6 @@ export default function EnrichmentStep({
     setEnrichPage(0);
   }, [enrichPageSize]);
 
-  // ---------- run enrichment ----------
-  const runEnrichment = async () => {
-    if (!sessionId) return;
-    setRunning(true);
-    setLastRun(null);
-    try {
-      const res = await fetch(
-        `${API_BASE}/enrichment/run?session_id=${encodeURIComponent(
-          sessionId
-        )}&limit=20`,
-        { method: "POST" }
-      );
-      const data = await res.json().catch(() => ({}));
-      setLastRun(data || {});
-      setHasRun(true); // ← only after user triggers enrichment
-      await fetchEnrichment(); // refresh the table with updated rows
-    } catch (e) {
-      console.error("Enrichment failed:", e);
-      setLastRun({ status: "error" });
-    } finally {
-      setRunning(false);
-    }
-  };
-
   // ---------- dynamic stats ----------
   const { leadsToEnrich, successfullyEnriched, successRate } = useMemo(() => {
     // Active = NOT discarded and NOT kept
@@ -171,7 +195,7 @@ export default function EnrichmentStep({
       (r) => r.dedup_action !== "DISCARD" && r.dedup_action !== "KEEP"
     );
 
-    // “Enriched” signal: any of LinkedIn URL / scraped phone / degree / year
+    // “Enriched” signal: any of LinkedIn URL / scraped phone / degree / year / email
     const enriched = active.filter((r) => {
       const hasLI =
         r.linkedin_url &&
@@ -197,6 +221,188 @@ export default function EnrichmentStep({
       successRate: rate,
     };
   }, [rows, hasRun]);
+
+  // ---------- polling helpers ----------
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearTimeout(pollRef.current);
+      pollRef.current = null;
+    }
+    setPolling(false);
+    pollAttemptsRef.current = 0;
+    prevDoneRef.current = null;
+  };
+
+  // ---------- poll progress endpoint (improved error handling + backoff stop) ----------
+  const pollOnce = async () => {
+    try {
+      const url = `${API_BASE}/enrichment/session_progress?session_id=${encodeURIComponent(
+        sessionId
+      )}`;
+      const resp = await fetch(url, { headers: getAuthHeaders() });
+
+      if (!resp.ok) {
+        // non-2xx — count as a failed poll attempt and maybe stop
+        console.error(
+          "Progress endpoint returned",
+          resp.status,
+          resp.statusText
+        );
+        pollAttemptsRef.current += 1;
+        if (pollAttemptsRef.current >= POLL_MAX_ATTEMPTS) {
+          stopPolling();
+          try {
+            if (window && window.showToast)
+              window.showToast(
+                "Enrichment polling stopped (progress endpoint error).",
+                "error"
+              );
+          } catch {}
+          return;
+        }
+        // schedule next attempt (simple backoff)
+        pollRef.current = setTimeout(pollOnce, POLL_INTERVAL_MS);
+        return;
+      }
+
+      const p = (await resp.json()) || {};
+      const total = Number(p.total || 0);
+      const done = Number(p.done || 0);
+      const runningCount = Number(p.running || 0);
+
+      setEnqueuedCount(total);
+
+      if (prevDoneRef.current === null || done !== prevDoneRef.current) {
+        // fetch rows only when done changed (or first poll)
+        // use AbortController to avoid race conditions
+        const ac = new AbortController();
+        await fetchEnrichment({ signal: ac.signal });
+        prevDoneRef.current = done;
+      }
+
+      pollAttemptsRef.current += 1;
+
+      // stop conditions
+      if (
+        (total > 0 && done >= total) ||
+        pollAttemptsRef.current >= POLL_MAX_ATTEMPTS ||
+        total === 0
+      ) {
+        stopPolling();
+
+        if (total > 0 && done >= total) {
+          try {
+            if (window && window.showToast)
+              window.showToast("Enrichment completed.", "success");
+          } catch {}
+        } else if (total === 0) {
+          try {
+            if (window && window.showToast)
+              window.showToast("No jobs were enqueued for enrichment.", "info");
+          } catch {}
+        } else {
+          try {
+            if (window && window.showToast)
+              window.showToast(
+                "Enrichment polling stopped (timeout).",
+                "warning"
+              );
+          } catch {}
+        }
+        return;
+      }
+
+      // continue polling
+      pollRef.current = setTimeout(pollOnce, POLL_INTERVAL_MS);
+    } catch (e) {
+      console.error("Polling error:", e);
+      pollAttemptsRef.current += 1;
+      if (pollAttemptsRef.current >= POLL_MAX_ATTEMPTS) {
+        stopPolling();
+        try {
+          if (window && window.showToast)
+            window.showToast("Enrichment polling stopped (error).", "error");
+        } catch {}
+        return;
+      }
+      // retry
+      pollRef.current = setTimeout(pollOnce, POLL_INTERVAL_MS);
+    }
+  };
+
+  // ---------- start enrichment (improved: robust value parsing + defensive polling start) ----------
+  const runEnrichment = async () => {
+    if (!sessionId) return;
+    setRunning(true);
+    setLastRun(null);
+    setEnqueuedCount(null);
+    try {
+      const authUser = getAuthUser();
+      const url = new URL(`${API_BASE}/enrichment/start`);
+      url.searchParams.set("session_id", sessionId);
+      if (authUser && authUser.email) {
+        url.searchParams.set("name", `Run by ${authUser.email}`);
+      }
+      if (authUser && authUser.user_id) {
+        url.searchParams.set("user_id", String(authUser.user_id));
+      }
+      const res = await fetch(url.toString(), {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      setLastRun(data || {});
+      setHasRun(true); // mark that user clicked "Start Enrichment"
+
+      const enq = Number(
+        data?.enqueued != null
+          ? data.enqueued
+          : data?.total != null
+          ? data.total
+          : 0
+      );
+      setEnqueuedCount(enq);
+
+      // refresh UI immediately (use AbortController to avoid overlapping fetches)
+      const ac = new AbortController();
+      await fetchEnrichment({ signal: ac.signal });
+
+      // start polling only if there are enqueued jobs
+      if (enq > 0) {
+        setPolling(true);
+        pollAttemptsRef.current = 0;
+        prevDoneRef.current = null;
+        // small delay then first poll
+        pollRef.current = setTimeout(pollOnce, POLL_INTERVAL_MS);
+      } else {
+        try {
+          if (window && window.showToast)
+            window.showToast(
+              "No active rows to enqueue for enrichment.",
+              "info"
+            );
+        } catch {}
+      }
+    } catch (e) {
+      console.error("Enrichment start failed:", e);
+      setLastRun({ status: "error" });
+      try {
+        if (window && window.showToast)
+          window.showToast("Failed to start enrichment.", "error");
+      } catch {}
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  // cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopPolling();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (!sessionId) {
     return (
@@ -261,25 +467,99 @@ export default function EnrichmentStep({
         </div>
 
         {/* Run enrichment */}
-        <div className="button-group" style={{ marginBottom: "1rem" }}>
+        <div
+          className="button-group"
+          style={{
+            marginBottom: "1rem",
+            display: "flex",
+            alignItems: "center",
+            gap: "12px",
+          }}
+        >
           <button
             className="btn btn-primary"
             onClick={runEnrichment}
-            disabled={running}
+            disabled={running} // disables immediately when clicked
+            style={{ display: "flex", alignItems: "center", gap: "8px" }}
           >
+            {running && (
+              <span
+                className="spinner"
+                style={{
+                  width: "16px",
+                  height: "16px",
+                  border: "2px solid #fff",
+                  borderTop: "2px solid transparent",
+                  borderRadius: "50%",
+                  display: "inline-block",
+                  animation: "spin 1s linear infinite",
+                }}
+              />
+            )}
             {running ? "Enriching…" : "Start Enrichment"}
           </button>
+
+          {/* Status / progress */}
           {lastRun && (
-            <span style={{ marginLeft: 12, color: "#6b7280" }}>
-              {lastRun.status === "ok"
-                ? `Processed ${lastRun.processed || 0}, updated ${
+            <span
+              style={{
+                marginLeft: 12,
+                color: "#6b7280",
+                display: "inline-block",
+              }}
+            >
+              {lastRun.status === "ok" ? (
+                lastRun.enqueued != null ? (
+                  <>
+                    <div>
+                      Enqueued <strong>{lastRun.enqueued}</strong> jobs —
+                      pollers will process them.
+                    </div>
+                    <div style={{ marginTop: 6 }}>
+                      <div
+                        style={{
+                          height: 8,
+                          width: 250,
+                          background: "#e5e7eb",
+                          borderRadius: 4,
+                          overflow: "hidden",
+                        }}
+                      >
+                        <div
+                          style={{
+                            height: "100%",
+                            width: `${
+                              leadsToEnrich
+                                ? Math.round(
+                                    (successfullyEnriched /
+                                      Math.max(1, leadsToEnrich)) *
+                                      100
+                                  )
+                                : 0
+                            }%`,
+                            background: "#10b981",
+                            transition: "width 400ms ease",
+                          }}
+                        />
+                      </div>
+                      <div style={{ fontSize: 12, marginTop: 6 }}>
+                        {successfullyEnriched} / {leadsToEnrich} enriched
+                        {polling ? " • processing…" : ""}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  `Processed ${lastRun.processed || 0}, updated ${
                     lastRun.updated || 0
                   }${lastRun.serp_key_present ? "" : " • SERP key missing"}${
                     lastRun.openai_key_present ? "" : " • OpenAI key missing"
                   }`
-                : lastRun?.status === "error"
-                ? "Last run failed."
-                : ""}
+                )
+              ) : lastRun?.status === "error" ? (
+                "Last run failed."
+              ) : (
+                ""
+              )}
             </span>
           )}
         </div>
@@ -324,8 +604,26 @@ export default function EnrichmentStep({
               ) : rows.length ? (
                 pagedRows.map((r, i) => {
                   const idx = enrichPage * enrichPageSize + i; // global index for helpers
+
+                  // visual cue whether row looks enriched
+                  const isEnriched =
+                    (r.linkedin_url &&
+                      String(r.linkedin_url)
+                        .toLowerCase()
+                        .includes("linkedin.com")) ||
+                    (r.email && String(r.email).trim()) ||
+                    (r.scraped_phone_number &&
+                      String(r.scraped_phone_number).trim()) ||
+                    (r.degree && String(r.degree).trim()) ||
+                    (r.degree_year && String(r.degree_year).trim());
+
                   return (
-                    <tr key={`${r.npi || idx}-${r.personpi || idx}`}>
+                    <tr
+                      key={`${r.npi || idx}-${r.personpi || idx}`}
+                      style={{
+                        background: isEnriched ? "#f8fffb" : undefined,
+                      }}
+                    >
                       <td>{r.npi || "-"}</td>
                       <td>{getName(r)}</td>
                       <td>
@@ -449,6 +747,7 @@ export default function EnrichmentStep({
               )}
             </tbody>
           </table>
+
           {/* pagination for enrichment table */}
           {rows.length > enrichPageSize && (
             <div style={{ marginTop: 10 }}>

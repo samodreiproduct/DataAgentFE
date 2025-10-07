@@ -224,6 +224,7 @@ export default function DataSourceStep({
   uploadedRows,
   setUploadedRows,
   nextStep,
+  openOngoingSessions,
 }) {
   const { updateFlowData } = useLeadFlow();
   const [scrapeResults, setScrapeResults] = useState([]);
@@ -688,7 +689,7 @@ export default function DataSourceStep({
 
       // if requested, proceed to next step (small delay so UI updates first)
       if (continueAfter) {
-        setTimeout(() => nextStep(), 120);
+        setTimeout(() => nextStep("deduplication"), 120);
       }
 
       return true;
@@ -712,7 +713,7 @@ export default function DataSourceStep({
       }
     } else {
       // preserve original behavior for scraping and others
-      nextStep();
+      nextStep("deduplication");
     }
   }
 
@@ -914,11 +915,6 @@ export default function DataSourceStep({
   async function handleManualContinue() {
     const auth = getAuthUser();
     const srcUser = auth?.user_id || undefined;
-    // only act when manual is selected
-    if (selectedSource !== "manual") {
-      nextStep();
-      return;
-    }
 
     // Client-side validation
     if (manualType === "Healthcare") {
@@ -1063,7 +1059,7 @@ export default function DataSourceStep({
       if (manualType === "Company") {
         nextStep("review");
       } else {
-        nextStep();
+        nextStep("deduplication");
       }
     } catch (err) {
       console.error("Manual entry failed:", err);
@@ -1256,11 +1252,28 @@ export default function DataSourceStep({
   return (
     <StepSection>
       <div id="data-source" className="step-section active">
-        <div className="step-header">
-          <h1 className="step-title">🔍 Select Data Source</h1>
-          <p className="step-description">
-            Choose how you want to add leads to your database
-          </p>
+        <div
+          className="step-header"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "1rem",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+            <h1 className="step-title" style={{ margin: 0 }}>
+              🔍 Select Data Source
+            </h1>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={openOngoingSessions}
+              title="View ongoing enrichment sessions"
+            >
+              🕒 Ongoing Sessions
+            </button>
+          </div>
         </div>
 
         <div className="options-grid">
@@ -2213,7 +2226,7 @@ export default function DataSourceStep({
                 ? handleManualContinue
                 : selectedSource === "upload"
                 ? handleContinueClick
-                : nextStep
+                : () => nextStep("deduplication")
             }
             disabled={
               (selectedSource === "manual" && manualLoading) ||

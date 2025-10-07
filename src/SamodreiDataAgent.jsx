@@ -12,10 +12,12 @@ import ExportStep from "./components/ExportStep";
 import MonitorStep from "./components/MonitorStep";
 import ReviewProduction from "./components/ReviewProduction";
 import AuthPage from "./components/auth/AuthPage";
+import OngoingSessions from "./components/OngoingSessions";
 
 export default function SamodreiDataAgent({ authUser, onLogout }) {
   const steps = [
     "data-source",
+    "ongoing-sessions",
     "deduplication",
     "enrichment",
     "review",
@@ -59,6 +61,18 @@ export default function SamodreiDataAgent({ authUser, onLogout }) {
     if (currentIndex < steps.length - 1) {
       showStep(steps[currentIndex + 1]);
     }
+  }
+
+  // Open the Ongoing Sessions screen
+  function openOngoingSessions() {
+    showStep("ongoing-sessions");
+  }
+
+  // Use a selected session: set sessionId and navigate to enrichment (or whichever step you prefer)
+  function useSessionAndOpenEnrichment(session_id) {
+    if (!session_id) return;
+    setSessionId(session_id);
+    showStep("enrichment");
   }
 
   function prevStep() {
@@ -275,6 +289,19 @@ export default function SamodreiDataAgent({ authUser, onLogout }) {
               uploadedRows={uploadedRows}
               setUploadedRows={setUploadedRows}
               nextStep={nextStep}
+              openOngoingSessions={openOngoingSessions}
+            />
+          )}
+          {/* Ongoing Sessions */}
+          {currentStep === "ongoing-sessions" && (
+            <OngoingSessions
+              // pass helpers so the component can tell parent to open a session or go back
+              onUseSession={(session_id) =>
+                useSessionAndOpenEnrichment(session_id)
+              }
+              onBack={() => showStep("data-source")}
+              // pass auth if the component needs to call APIs and include user id / tokens
+              authUser={authUser}
             />
           )}
 
