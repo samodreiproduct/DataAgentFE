@@ -1,6 +1,9 @@
 // =======================================
 // File: src/components/EnrichmentStep.jsx
 // =======================================
+// It is used for Enrihcbhing data from External sources
+// currently using Serp for linked-In scrapping and Contact-out for email and phone
+//adding npi also for phone number scraping.
 import React, {
   useEffect,
   useMemo,
@@ -26,6 +29,9 @@ export default function EnrichmentStep({
   const [running, setRunning] = useState(false);
   const [lastRun, setLastRun] = useState(null);
   const [hasRun, setHasRun] = useState(false); // ← gate “Successfully Enriched” until user runs
+  // ✅ New checkboxes for optional enrichment sources
+  const [useNPI, setUseNPI] = useState(false);
+  const [useContactOut, setUseContactOut] = useState(false);
 
   // Polling / progress states
   const [enqueuedCount, setEnqueuedCount] = useState(null);
@@ -346,9 +352,13 @@ export default function EnrichmentStep({
       if (authUser && authUser.user_id) {
         url.searchParams.set("user_id", String(authUser.user_id));
       }
+      // add query params for NPI and ContactOut flags
+      url.searchParams.set("use_npi", useNPI ? 1 : 0);
+      url.searchParams.set("use_contactout", useContactOut ? 1 : 0);
+
       const res = await fetch(url.toString(), {
         method: "POST",
-        headers: getAuthHeaders(),
+        headers: getAuthHeaders(), // no need for Content-Type or body
       });
 
       const data = await res.json().catch(() => ({}));
@@ -425,31 +435,6 @@ export default function EnrichmentStep({
           </p>
         </div>
 
-        {/* Providers (NPI/US Healthcare: Serp + LinkedIn, both on & locked) */}
-        {isNPIFlow && (
-          <div className="form-group">
-            <label className="form-label">Enrichment Providers</label>
-            <div className="checkbox-grid">
-              <div className="checkbox-item">
-                <input type="checkbox" id="serp" checked disabled readOnly />
-                <label htmlFor="serp">Serp (Google)</label>
-              </div>
-              <div className="checkbox-item">
-                <input
-                  type="checkbox"
-                  id="linkedin"
-                  checked
-                  disabled
-                  readOnly
-                />
-                <label htmlFor="linkedin">
-                  ContactOut (via LinkedIn profile)
-                </label>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* 3 dynamic boxes */}
         <div className="stats-grid">
           <div className="stat-card">
@@ -464,6 +449,44 @@ export default function EnrichmentStep({
             <div className="stat-number">{successRate}%</div>
             <div className="stat-label">Success Rate</div>
           </div>
+        </div>
+
+        {/* Enrichment Options */}
+        <div
+          className="form-group"
+          style={{
+            marginBottom: "1rem",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
+          <label
+            className="form-label"
+            style={{ fontWeight: 600, marginBottom: "4px" }}
+          >
+            Enrichment Options
+          </label>
+
+          <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <input
+              type="checkbox"
+              checked={useNPI}
+              onChange={(e) => setUseNPI(e.target.checked)}
+            />
+            <span>
+              Use NPI{" "}
+              <small style={{ color: "#6b7280" }}>(only works for US)</small>
+            </span>
+          </label>
+
+          <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <input
+              type="checkbox"
+              checked={useContactOut}
+              onChange={(e) => setUseContactOut(e.target.checked)}
+            />
+            <span>Use ContactOut</span>
+          </label>
         </div>
 
         {/* Run enrichment */}
@@ -673,31 +696,75 @@ export default function EnrichmentStep({
                       <td>{getSecondary(r)}</td>
                       <td className="phone">
                         {(() => {
-                          const enriched = r.scraped_phone_number || "";
-                          if (!enriched) return "-";
-                          const phoneA = asArray(r.phone);
-                          const phoneNum = asArray(r.phone_number);
-                          const phoneNums = asArray(r.phone_numbers);
-                          const known = unique([
-                            ...phoneA,
-                            ...phoneNum,
-                            ...phoneNums,
+                          // Helper: convert JSON/string to array
+                          const toArray = (val) => {
+                            if (!val) return [];
+                            if (Array.isArray(val)) return val.filter(Boolean);
+                            if (typeof val === "string") {
+                              try {
+                                const parsed = JSON.parse(val);
+                                if (Array.isArray(parsed))
+                                  return parsed.filter(Boolean);
+                              } catch {
+                                return val
+                                  .split(/[;,]/)
+                                  .map((s) => s.trim())
+                                  .filter(Boolean);
+                              }
+                            }
+                            return [];
+                          };
+
+                          // Uploaded numbers (user-provided)
+                          const uploaded = unique([
+                            ...toArray(r.phone),
+                            ...toArray(r.phone_number),
+                            ...toArray(r.scraped_phone_number),
+                            ...toArray(r.phone_numbers),
                           ]);
-                          const knownDigits = new Set(
-                            known.map(normalizeDigits)
+
+                          // Enriched from ContactOut + NPI
+                          const coPhones = unique(toArray(r.co_phones));
+                          const npiPhones = unique(toArray(r.npi_phones));
+
+                          // Combine enriched sources
+                          const enrichedList = unique([
+                            ...coPhones,
+                            ...npiPhones,
+                          ]);
+
+                          if (!enrichedList.length) return "-";
+
+                          // Detect duplicates (same as uploaded)
+                          const uploadedDigits = new Set(
+                            uploaded.map(normalizeDigits)
                           );
-                          const isDuplicate = knownDigits.has(
-                            normalizeDigits(enriched)
-                          );
+
                           return (
-                            <span
+                            <div
                               style={{
-                                color: isDuplicate ? "#dc2626" : undefined,
-                                fontWeight: isDuplicate ? 700 : 400,
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 4,
                               }}
                             >
-                              {enriched}
-                            </span>
+                              {enrichedList.map((p, j) => {
+                                const dup = uploadedDigits.has(
+                                  normalizeDigits(p)
+                                );
+                                return (
+                                  <span
+                                    key={p + j}
+                                    style={{
+                                      color: dup ? "#dc2626" : "#111827",
+                                      fontWeight: dup ? 700 : 400,
+                                    }}
+                                  >
+                                    {p}
+                                  </span>
+                                );
+                              })}
+                            </div>
                           );
                         })()}
                       </td>

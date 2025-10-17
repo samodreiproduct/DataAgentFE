@@ -58,6 +58,27 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
     }
     return v;
   };
+  const asArray = (v) => {
+    if (!v) return [];
+    if (Array.isArray(v)) return v.filter(Boolean);
+    if (typeof v === "string") {
+      try {
+        const p = JSON.parse(v);
+        if (Array.isArray(p)) return p.filter(Boolean);
+      } catch {
+        // comma/semicolon separated fallback
+        return v
+          .split(/[;,]/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+    }
+    return [];
+  };
+
+  const normalizeDigits = (s) => String(s || "").replace(/[^\d]/g, ""); // only digits for comparison
+
+  const unique = (arr) => Array.from(new Set((arr || []).filter(Boolean)));
 
   // compute current visible column count (we always show select + action now)
   const colCount = useMemo(() => {
@@ -695,8 +716,63 @@ export default function ReviewStep({ prevStep, nextStep, sessionId }) {
                           <td>{getPrimary(r)}</td>
                           <td>{getSecondary(r)}</td>
                           <td className="phone">
-                            {r.scraped_phone_number || "-"}
+                            {(() => {
+                              // Gather uploaded numbers (user-provided)
+                              const uploaded = unique([
+                                ...asArray(r.phone),
+                                ...asArray(r.phone_number),
+                                ...asArray(r.scraped_phone_number),
+                                ...asArray(r.phone_numbers),
+                              ]);
+
+                              // Get enriched numbers from ContactOut + NPI (support JSON/string)
+                              const coPhones = unique(
+                                asArray(safeJson(r.co_phones) || r.co_phones)
+                              );
+                              const npiPhones = unique(
+                                asArray(safeJson(r.npi_phones) || r.npi_phones)
+                              );
+
+                              const enrichedList = unique([
+                                ...coPhones,
+                                ...npiPhones,
+                              ]);
+
+                              if (!enrichedList.length) return "-";
+
+                              const uploadedDigits = new Set(
+                                uploaded.map(normalizeDigits)
+                              );
+
+                              return (
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: 4,
+                                  }}
+                                >
+                                  {enrichedList.map((p, j) => {
+                                    const isDup = uploadedDigits.has(
+                                      normalizeDigits(p)
+                                    );
+                                    return (
+                                      <span
+                                        key={String(p) + j}
+                                        style={{
+                                          color: isDup ? "#dc2626" : undefined,
+                                          fontWeight: isDup ? 700 : 400,
+                                        }}
+                                      >
+                                        {p}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            })()}
                           </td>
+
                           <td>
                             {r.degree || r.degree_year ? (
                               <>

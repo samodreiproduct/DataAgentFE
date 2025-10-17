@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import StepSection from "./StepSection";
 import Papa from "papaparse"; // for csv preview
 import * as XLSX from "xlsx"; // for excel preview
@@ -9,6 +9,7 @@ import { getAuthHeaders, getAuthUser } from "../context/LeadFlowContext";
 import PaginationControls from "./ui/PaginationControls";
 const API_BASE = import.meta.env.VITE_API_BASE;
 
+// This is the first screen where we have Rule-Based Scraping, upload csv and manual entry;
 // -- phone helpers (de-dupe & pretty) --
 const DIGITS = /\d/g;
 const digitsOnly = (s) => (s ? (s + "").match(DIGITS)?.join("") ?? "" : "");
@@ -239,8 +240,10 @@ export default function DataSourceStep({
   const UPLOAD_PAGE_SIZE = 50;
   const [speciality, setSpeciality] = useState("");
   const [regionScope, setRegionScope] = useState("");
+  const [scrapeMode, setScrapeMode] = useState("preset"); // 'preset' | 'custom'
+  const [customRequirement, setCustomRequirement] = useState("");
   // user-selectable fetch limit (default 5000)
-  const [maxResults, setMaxResults] = useState(5000);
+  const [maxResults, setMaxResults] = useState(1);
   const MAX_ALLOWED = 50000; // front-end safety limit
   const [uploadTarget, setUploadTarget] = useState("");
   const [primaryKey, setPrimaryKey] = useState("");
@@ -255,6 +258,7 @@ export default function DataSourceStep({
   const [manualType, setManualType] = useState("Company"); // "Company" | "Healthcare"
   const [manualLoading, setManualLoading] = useState(false);
   const [uploadedHeaders, setUploadedHeaders] = useState([]); // <-- new
+  const customRef = useRef(null);
 
   // Company manual form state (keeps existing fields)
   const [manualCompany, setManualCompany] = useState({
@@ -725,9 +729,42 @@ export default function DataSourceStep({
     if (!npi) setRegionScope("");
   }
 
+  function clampFetchLimit(value) {
+    let v = Number(value) || 1;
+
+    // if NPI mode (Healthcare in USA)
+    if (isNPI) {
+      if (v > 1000) v = 1000; // cap NPI according to requirements
+    } else {
+      // For all SERP + custom modes: max 2
+      if (v > 2) v = 2; // cap SERP/custom according to requirements
+    }
+
+    if (v < 1) v = 1;
+    return v;
+  }
+
   useEffect(() => {
     recomputeIsNPI();
   }, [selectedSource]);
+
+  // for clearing tables and selection fields for rule-based scraping:
+  // Clear previous fetch results / errors when user switches between preset/custom
+  useEffect(() => {
+    // If switching to custom, clear any table results from a previous preset fetch
+    if (scrapeMode === "custom") {
+      setScrapeResults([]);
+      setScrapePage(0);
+      setScrapeError(null);
+      setIsNPI(false);
+      customRef.current?.focus();
+    } else {
+      // switching back to preset: keep the UI clean, clear custom input and errors
+      setCustomRequirement("");
+      setScrapeError(null);
+      recomputeIsNPI();
+    }
+  }, [scrapeMode]);
 
   // inside useEffect
   useEffect(() => {
@@ -779,7 +816,7 @@ export default function DataSourceStep({
       '#scraping-form input[name="roles"]:checked'
     );
     const roles = Array.from(roleNodes).map((n) => n.value);
-    return { geography, industry, roles };
+    return { geography, industry, roles, scrapeMode, customRequirement };
   }
 
   // ---------- NPI helpers ----------
@@ -1082,22 +1119,47 @@ export default function DataSourceStep({
 
     const { geography, industry, roles } = gatherScrapeFormValues();
 
-    if (!geography || geography === "Select Region") {
-      setScrapeError("Please select a target geography.");
-      setScrapeLoading(false);
-      return;
-    }
-    if (!industry || industry === "Select Industry") {
-      setScrapeError("Please select an Industry Focus.");
-      setScrapeLoading(false);
-      return;
-    }
-    if (!speciality || speciality.trim() === "") {
-      setScrapeError("Please enter a Speciality / Niche.");
-      setScrapeLoading(false);
-      return;
-    }
+    // if (!geography || geography === "Select Region") {
+    //   setScrapeError("Please select a target geography.");
+    //   setScrapeLoading(false);
+    //   return;
+    // }
+    // if (!industry || industry === "Select Industry") {
+    //   setScrapeError("Please select an Industry Focus.");
+    //   setScrapeLoading(false);
+    //   return;
+    // }
+    // if (!speciality || speciality.trim() === "") {
+    //   setScrapeError("Please enter a Speciality / Niche.");
+    //   setScrapeLoading(false);
+    //   return;
+    // }
 
+    // validations: if using preset mode, validate the usual fields.
+    if (scrapeMode === "preset") {
+      if (!geography || geography === "Select Region") {
+        setScrapeError("Please select a target geography.");
+        setScrapeLoading(false);
+        return;
+      }
+      if (!industry || industry === "Select Industry") {
+        setScrapeError("Please select an Industry Focus.");
+        setScrapeLoading(false);
+        return;
+      }
+      if (!speciality || speciality.trim() === "") {
+        setScrapeError("Please enter a Speciality / Niche.");
+        setScrapeLoading(false);
+        return;
+      }
+    } else {
+      // custom mode: require a custom requirement string
+      if (!customRequirement || customRequirement.trim() === "") {
+        setScrapeError("Please enter a custom requirement to search for.");
+        setScrapeLoading(false);
+        return;
+      }
+    }
     // Enforce state selection for NPI
     if (geography === "United States" && industry === "Healthcare") {
       if (!regionScope || !usStates.includes(regionScope)) {
@@ -1180,13 +1242,14 @@ export default function DataSourceStep({
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
           body: JSON.stringify({
-            Nature_of_company: industry,
-            region: geography,
-            speciality,
-            roles,
+            Nature_of_company: scrapeMode === "preset" ? industry : "Custom",
+            region: scrapeMode === "preset" ? geography : "Custom",
+            speciality:
+              scrapeMode === "preset" ? speciality : customRequirement,
+            roles: scrapeMode === "preset" ? roles : [customRequirement],
             session_id: sid,
-            limit: 2,
-            linkedin_scrape: false, // or true if you want LinkedIn enrichment immediately
+            limit: clampFetchLimit(maxResults), // safely restricted to 2
+            linkedin_scrape: false,
             source_user_id: auth?.user_id || undefined,
           }),
         });
@@ -1327,7 +1390,8 @@ export default function DataSourceStep({
           className="form-section"
           style={{ display: selectedSource === "scraping" ? "block" : "none" }}
         >
-          <h3
+          {/* commented part is for rule-based scrapping added 2 radio button for custom entry by user: */}
+          {/* <h3
             style={{
               fontSize: "1.5rem",
               fontWeight: 700,
@@ -1379,115 +1443,184 @@ export default function DataSourceStep({
                 <option>Manufacturing</option>
               </select>
             </div>
+          </div> */}
+          <h3
+            style={{
+              fontSize: "1.5rem",
+              fontWeight: 700,
+              marginBottom: "1rem",
+              color: "#1f2937",
+            }}
+          >
+            Configure Scraping Rules
+          </h3>
+
+          {/* Mode selector: preset (default) or custom requirement */}
+          {/* Mode selector: preset (default) or custom requirement */}
+          <div
+            style={{
+              marginBottom: "1.25rem",
+              display: "flex",
+              gap: 12,
+              alignItems: "center",
+            }}
+          >
+            <label style={{ fontWeight: 600, marginRight: 8 }}>Mode</label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="radio"
+                name="scrape-mode"
+                value="preset"
+                checked={scrapeMode === "preset"}
+                onChange={() => {
+                  setScrapeMode("preset");
+                  setScrapeResults([]);
+                  setScrapePage(0);
+                  setScrapeError(null);
+                  recomputeIsNPI();
+                }}
+              />
+              <span>Use predefined filters</span>
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input
+                type="radio"
+                name="scrape-mode"
+                value="custom"
+                checked={scrapeMode === "custom"}
+                onChange={() => {
+                  setScrapeMode("custom");
+                  setScrapeResults([]);
+                  setScrapePage(0);
+                  setScrapeError(null);
+                  setIsNPI(false);
+                }}
+              />
+              <span>Custom requirement</span>
+            </label>
           </div>
 
-          {/* State selector (NPI only) */}
-          {isNPI && (
+          {scrapeMode === "preset" ? (
+            /* PRESET: all preset-only controls live here (geography, industry, NPI-state, speciality, data-source) */
+            <>
+              <div className="form-grid">
+                <div className="form-group">
+                  <label className="form-label">Target Geography</label>
+                  <select
+                    id="target-geography-select"
+                    className="form-select"
+                    defaultValue="United States"
+                    onChange={recomputeIsNPI}
+                  >
+                    <option>Select Region</option>
+                    <option>India</option>
+                    <option>United States</option>
+                    <option>Europe</option>
+                    <option>Asia-Pacific</option>
+                    <option>Global</option>
+                  </select>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Industry Focus</label>
+                  <select
+                    id="industry-focus-select"
+                    className="form-select"
+                    defaultValue="Select Industry"
+                    onChange={(e) => {
+                      const selected = e.target.value;
+                      setSpecialityPlaceholder(
+                        specialityHints[selected] || "Enter specific niche"
+                      );
+                      recomputeIsNPI();
+                    }}
+                  >
+                    <option>Select Industry</option>
+                    <option>SaaS</option>
+                    <option>Fintech</option>
+                    <option>E-commerce</option>
+                    <option>Healthcare</option>
+                    <option>Education</option>
+                    <option>Manufacturing</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* NPI State selector (preset-only) */}
+              {isNPI && (
+                <div className="form-group">
+                  <label className="form-label">Select U.S. State</label>
+                  <select
+                    className="form-select"
+                    value={regionScope}
+                    onChange={(e) => setRegionScope(e.target.value)}
+                  >
+                    <option value="">Select State</option>
+                    {usStates.map((state) => (
+                      <option key={state} value={state}>
+                        {state}
+                      </option>
+                    ))}
+                  </select>
+                  <small className="form-text text-muted">
+                    State is required for NPI search.
+                  </small>
+                </div>
+              )}
+
+              {/* Speciality / Niche (preset-only) */}
+              <div className="form-group">
+                <label className="form-label">Speciality / Niche</label>
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder={specialityPlaceholder}
+                  value={speciality}
+                  onChange={(e) => setSpeciality(e.target.value)}
+                />
+              </div>
+
+              {/* Data Source (preset-only) */}
+              {!isNPI ? (
+                <div className="form-group">
+                  <label className="form-label">Data Source</label>
+                  <div className="checkbox-item">
+                    <input type="checkbox" checked disabled readOnly />
+                    <label>Google Maps</label>
+                  </div>
+                </div>
+              ) : (
+                <div className="form-group">
+                  <label className="form-label">Data Source</label>
+                  <div className="checkbox-item">
+                    <input type="checkbox" checked disabled readOnly />
+                    <label>NPI Registry</label>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            /* CUSTOM: only textarea + small helper text (no preset inputs) */
             <div className="form-group">
-              <label className="form-label">Select U.S. State</label>
-              <select
-                className="form-select"
-                value={regionScope}
-                onChange={(e) => setRegionScope(e.target.value)}
+              <label className="form-label">Custom Requirement</label>
+              <textarea
+                ref={customRef}
+                className="form-input"
+                rows={4}
+                placeholder="Describe what you want to find (e.g., 'dermatology clinics in Florida with contact details' or 'IT companies in Bangalore with phone numbers')"
+                value={customRequirement}
+                onChange={(e) => setCustomRequirement(e.target.value)}
+              />
+              <small
+                style={{ color: "#6b7280", display: "block", marginTop: 6 }}
               >
-                <option value="">Select State</option>
-                {usStates.map((state) => (
-                  <option key={state} value={state}>
-                    {state}
-                  </option>
-                ))}
-              </select>
-              <small className="form-text text-muted">
-                State is required for NPI search.
+                Your custom text will be sent to the backend as the search
+                requirement.
               </small>
             </div>
           )}
 
-          {/* Speciality/Niche Field (used as NPI specialty, e.g., "Dermatology") */}
-          <div className="form-group">
-            <label className="form-label">Speciality / Niche</label>
-            <input
-              type="text"
-              className="form-input"
-              placeholder={specialityPlaceholder}
-              value={speciality}
-              onChange={(e) => setSpeciality(e.target.value)}
-            />
-          </div>
-
-          {/* Roles: hidden for NPI; show single Prescriber checkbox (disabled & checked) */}
-          {isNPI ? (
-            <div className="form-group">
-              <label className="form-label">Role</label>
-              <div className="checkbox-item">
-                <input type="checkbox" checked disabled readOnly />
-                <label>Prescriber</label>
-              </div>
-            </div>
-          ) : (
-            <div className="form-group">
-              <label className="form-label">Target Roles & Titles</label>
-              <div className="checkbox-grid">
-                <div className="checkbox-item">
-                  <input type="checkbox" id="ceo" name="roles" value="CEO" />
-                  <label htmlFor="ceo">CEO / Chief Executive Officer</label>
-                </div>
-                <div className="checkbox-item">
-                  <input type="checkbox" id="cmo" name="roles" value="CMO" />
-                  <label htmlFor="cmo">CMO / Chief Marketing Officer</label>
-                </div>
-                <div className="checkbox-item">
-                  <input type="checkbox" id="cto" name="roles" value="CTO" />
-                  <label htmlFor="cto">CTO / Chief Technology Officer</label>
-                </div>
-                <div className="checkbox-item">
-                  <input
-                    type="checkbox"
-                    id="founder"
-                    name="roles"
-                    value="Founder"
-                  />
-                  <label htmlFor="founder">Founder / Co-Founder</label>
-                </div>
-                <div className="checkbox-item">
-                  <input type="checkbox" id="vp" name="roles" value="VP" />
-                  <label htmlFor="vp">VP / Vice President</label>
-                </div>
-                <div className="checkbox-item">
-                  <input
-                    type="checkbox"
-                    id="director"
-                    name="roles"
-                    value="Director"
-                  />
-                  <label htmlFor="director">Director / Senior Director</label>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Data Source (always SERP/Google Maps) */}
-          {!isNPI && (
-            <div className="form-group">
-              <label className="form-label">Data Source</label>
-              <div className="checkbox-item">
-                <input type="checkbox" checked disabled readOnly />
-                <label>Google Maps (via SERP API)</label>
-              </div>
-            </div>
-          )}
-
-          {isNPI && (
-            <div className="form-group">
-              <label className="form-label">Data Source</label>
-              <div className="checkbox-item">
-                <input type="checkbox" checked disabled readOnly />
-                <label>NPI Registry</label>
-              </div>
-            </div>
-          )}
-
-          {/* Fetch Leads button */}
+          {/* ---------- COMMON: Fetch controls (present for both modes) ---------- */}
           <div
             style={{
               marginTop: 20,
@@ -1499,7 +1632,6 @@ export default function DataSourceStep({
           >
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
               <label style={{ fontWeight: 600 }}>Fetch</label>
-              {/* suggestions: 100, 500, 1000, 5000 */}
               <input
                 type="number"
                 min={1}
@@ -1507,13 +1639,8 @@ export default function DataSourceStep({
                 step={1}
                 value={maxResults}
                 onChange={(e) => {
-                  const v = Number(e.target.value) || 0;
-                  // clamp for safety
-                  const clamp = Math.max(
-                    1,
-                    Math.min(MAX_ALLOWED, Math.floor(v))
-                  );
-                  setMaxResults(clamp);
+                  const v = clampFetchLimit(e.target.value);
+                  setMaxResults(v);
                 }}
                 style={{
                   width: 120,
@@ -1531,13 +1658,24 @@ export default function DataSourceStep({
                 <option value="5000" />
               </datalist>
               <span style={{ color: "#6b7280" }}>rows (type custom value)</span>
+
+              {isNPI && (
+                <small
+                  style={{ color: "#10b981", display: "block", marginTop: 4 }}
+                >
+                  ✅ NPI Registry allows up to 1000 results per fetch.
+                </small>
+              )}
             </div>
 
             <div>
               <button
                 className="btn btn-primary"
                 onClick={handleStartScraping}
-                disabled={scrapeLoading}
+                disabled={
+                  scrapeLoading ||
+                  (scrapeMode === "custom" && !customRequirement)
+                }
                 title="Fetch leads from chosen source"
               >
                 {scrapeLoading
@@ -1547,7 +1685,7 @@ export default function DataSourceStep({
             </div>
           </div>
 
-          {/* Scrape Results */}
+          {/* ---------- COMMON: Scrape Results Table ---------- */}
           <div className="scrape-results" style={{ marginTop: "1.5rem" }}>
             {scrapeResults.length > 0 ? (
               <table className="data-table">
@@ -1653,7 +1791,8 @@ export default function DataSourceStep({
               <p>No results yet.</p>
             )}
           </div>
-          {/* Scrape pagination controls */}
+
+          {/* ---------- COMMON: Pagination (single place) ---------- */}
           {scrapeResults.length > SCRAPE_PAGE_SIZE && (
             <PaginationControls
               currentPage={scrapePage}
@@ -1661,6 +1800,59 @@ export default function DataSourceStep({
               onPageChange={(p) => setScrapePage(p)}
             />
           )}
+
+          {/* Roles: hidden for NPI; show single Prescriber checkbox (disabled & checked) */}
+          {/* {isNPI ? (
+            <div className="form-group">
+              <label className="form-label">Role</label>
+              <div className="checkbox-item">
+                <input type="checkbox" checked disabled readOnly />
+                <label>Prescriber</label>
+              </div>
+            </div>
+          ) : (
+            <div className="form-group">
+              <label className="form-label">Target Roles & Titles</label>
+              <div className="checkbox-grid">
+                <div className="checkbox-item">
+                  <input type="checkbox" id="ceo" name="roles" value="CEO" />
+                  <label htmlFor="ceo">CEO / Chief Executive Officer</label>
+                </div>
+                <div className="checkbox-item">
+                  <input type="checkbox" id="cmo" name="roles" value="CMO" />
+                  <label htmlFor="cmo">CMO / Chief Marketing Officer</label>
+                </div>
+                <div className="checkbox-item">
+                  <input type="checkbox" id="cto" name="roles" value="CTO" />
+                  <label htmlFor="cto">CTO / Chief Technology Officer</label>
+                </div>
+                <div className="checkbox-item">
+                  <input
+                    type="checkbox"
+                    id="founder"
+                    name="roles"
+                    value="Founder"
+                  />
+                  <label htmlFor="founder">Founder / Co-Founder</label>
+                </div>
+                <div className="checkbox-item">
+                  <input type="checkbox" id="vp" name="roles" value="VP" />
+                  <label htmlFor="vp">VP / Vice President</label>
+                </div>
+                <div className="checkbox-item">
+                  <input
+                    type="checkbox"
+                    id="director"
+                    name="roles"
+                    value="Director"
+                  />
+                  <label htmlFor="director">Director / Senior Director</label>
+                </div>
+              </div>
+            </div>
+          )} */}
+
+          {/* Data Source (always SERP:Google Maps) */}
         </div>
 
         {/* Upload Form */}
