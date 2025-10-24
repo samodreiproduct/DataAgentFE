@@ -537,6 +537,11 @@ export default function DataSourceStep({
       alert("No mapping to save");
       return false;
     }
+    if (window.__remapInProgress) {
+      console.warn("Duplicate remap trigger ignored.");
+      return false;
+    }
+    window.__remapInProgress = true;
 
     const uploadedCols =
       uploadedHeaders && uploadedHeaders.length
@@ -703,6 +708,7 @@ export default function DataSourceStep({
       return false;
     } finally {
       setMappingSaving(false);
+      window.__remapInProgress = false;
     }
   }
 

@@ -29,9 +29,13 @@ export default function EnrichmentStep({
   const [running, setRunning] = useState(false);
   const [lastRun, setLastRun] = useState(null);
   const [hasRun, setHasRun] = useState(false); // ← gate “Successfully Enriched” until user runs
+  // Remove-same-numbers button state (single-click guard + in-flight flag)
+  const [removeRunning, setRemoveRunning] = useState(false);
+  const [removeClicked, setRemoveClicked] = useState(false);
   // ✅ New checkboxes for optional enrichment sources
   const [useNPI, setUseNPI] = useState(false);
   const [useContactOut, setUseContactOut] = useState(false);
+  const [findNPI, setFindNPI] = useState(false);
 
   // Polling / progress states
   const [enqueuedCount, setEnqueuedCount] = useState(null);
@@ -90,7 +94,19 @@ export default function EnrichmentStep({
     return [];
   };
 
-  const normalizeDigits = (s) => String(s || "").replace(/[^\d]/g, ""); // only digits for comparison
+  // more robust: collect all digit codepoints and join them.
+  // falls back to empty string when no digits present.
+  const normalizeDigits = (s) => {
+    if (s == null) return "";
+    const str = String(s);
+    // Prefer Unicode-aware digit extraction (covers full-width digits etc.)
+    let m = str.match(/\p{N}/gu); // requires modern browsers (Chrome/Edge/Firefox support)
+    if (!m) {
+      // fallback to ASCII digits if Unicode property not available or no match
+      m = str.match(/\d/g);
+    }
+    return m ? m.join("") : "";
+  };
 
   const unique = (arr) => Array.from(new Set(arr.filter(Boolean)));
 
@@ -355,6 +371,7 @@ export default function EnrichmentStep({
       // add query params for NPI and ContactOut flags
       url.searchParams.set("use_npi", useNPI ? 1 : 0);
       url.searchParams.set("use_contactout", useContactOut ? 1 : 0);
+      url.searchParams.set("find_npi", findNPI ? 1 : 0);
 
       const res = await fetch(url.toString(), {
         method: "POST",
@@ -403,6 +420,69 @@ export default function EnrichmentStep({
       } catch {}
     } finally {
       setRunning(false);
+    }
+  };
+
+  // Remove same phone numbers (call commit_review). Single-click only.
+  const removeSameNumbers = async (opts = {}) => {
+    if (!sessionId) return;
+    if (removeClicked) return; // already done once (single-click guard)
+    setRemoveRunning(true);
+
+    try {
+      // Option A: only commit for visible page (safer for large sessions)
+      // Build personpi list from current page rows
+      const personpis = pagedRows
+        .map((r) => r.personpi)
+        .filter((p) => p != null);
+
+      const url = new URL(`${API_BASE}/enrichment/commit_review`);
+      url.searchParams.set("session_id", sessionId);
+
+      // If you prefer whole-session commit, omit personpis and don't set query param
+      if (personpis.length) {
+        // append multiple personpis
+        personpis.forEach((pi) =>
+          url.searchParams.append("personpis", String(pi))
+        );
+      }
+
+      const res = await fetch(url.toString(), {
+        method: "POST",
+        headers: getAuthHeaders(),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        console.error("commit_review failed", res.status, data);
+        try {
+          if (window && window.showToast)
+            window.showToast("Failed to remove same numbers.", "error");
+        } catch {}
+        return;
+      }
+
+      // success: mark as clicked so button can't be clicked again
+      setRemoveClicked(true);
+      try {
+        if (window && window.showToast)
+          window.showToast(
+            `Removed ${data.updated || 0} duplicate numbers.`,
+            "success"
+          );
+      } catch {}
+
+      // Refresh table to reflect removed numbers
+      await fetchEnrichment();
+    } catch (e) {
+      console.error("removeSameNumbers error:", e);
+      try {
+        if (window && window.showToast)
+          window.showToast("Error while removing same numbers.", "error");
+      } catch {}
+    } finally {
+      setRemoveRunning(false);
     }
   };
 
@@ -467,11 +547,20 @@ export default function EnrichmentStep({
             Enrichment Options
           </label>
 
-          <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              opacity: findNPI ? 0.5 : 1, // grey out visually
+              pointerEvents: findNPI ? "none" : "auto", // prevent clicks when Find NPI active
+            }}
+          >
             <input
               type="checkbox"
               checked={useNPI}
               onChange={(e) => setUseNPI(e.target.checked)}
+              disabled={findNPI} // disable when Find NPI selected
             />
             <span>
               Use NPI{" "}
@@ -479,13 +568,44 @@ export default function EnrichmentStep({
             </span>
           </label>
 
-          <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              opacity: findNPI ? 0.5 : 1, // grey out visually
+              pointerEvents: findNPI ? "none" : "auto", // prevent clicks
+            }}
+          >
             <input
               type="checkbox"
               checked={useContactOut}
               onChange={(e) => setUseContactOut(e.target.checked)}
+              disabled={findNPI} // disable when Find NPI selected
             />
             <span>Use ContactOut</span>
+          </label>
+
+          <label style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <input
+              type="checkbox"
+              checked={findNPI}
+              onChange={(e) => {
+                const checked = e.target.checked;
+                setFindNPI(checked);
+                if (checked) {
+                  // auto-uncheck the others for clarity
+                  setUseNPI(false);
+                  setUseContactOut(false);
+                }
+              }}
+            />
+            <span>
+              Find NPI{" "}
+              <small style={{ color: "#6b7280" }}>
+                (detect NPI using Name, City, State, Specialty)
+              </small>
+            </span>
           </label>
         </div>
 
@@ -502,7 +622,7 @@ export default function EnrichmentStep({
           <button
             className="btn btn-primary"
             onClick={runEnrichment}
-            disabled={running} // disables immediately when clicked
+            disabled={running || polling} // disable during request or while poller running
             style={{ display: "flex", alignItems: "center", gap: "8px" }}
           >
             {running && (
@@ -520,6 +640,25 @@ export default function EnrichmentStep({
               />
             )}
             {running ? "Enriching…" : "Start Enrichment"}
+          </button>
+
+          {/* Remove same phone numbers button — always visible now */}
+          <button
+            className="btn btn-warning"
+            onClick={removeSameNumbers}
+            disabled={removeRunning || removeClicked || polling || running}
+            style={{ display: "flex", alignItems: "center", gap: "8px" }}
+            title={
+              removeClicked
+                ? "Already removed duplicate numbers"
+                : "Remove enriched numbers that match uploaded numbers"
+            }
+          >
+            {removeRunning
+              ? "Removing…"
+              : removeClicked
+              ? "Removed"
+              : "Remove same phone numbers"}
           </button>
 
           {/* Status / progress */}
@@ -696,38 +835,58 @@ export default function EnrichmentStep({
                       <td>{getSecondary(r)}</td>
                       <td className="phone">
                         {(() => {
-                          // Helper: convert JSON/string to array
+                          // helper: convert JSON/string to array (keeps only non-empty strings)
                           const toArray = (val) => {
                             if (!val) return [];
-                            if (Array.isArray(val)) return val.filter(Boolean);
+                            if (Array.isArray(val))
+                              return val
+                                .map(String)
+                                .map((s) => s.trim())
+                                .filter(Boolean);
                             if (typeof val === "string") {
                               try {
                                 const parsed = JSON.parse(val);
                                 if (Array.isArray(parsed))
-                                  return parsed.filter(Boolean);
+                                  return parsed
+                                    .map(String)
+                                    .map((s) => s.trim())
+                                    .filter(Boolean);
                               } catch {
-                                return val
-                                  .split(/[;,]/)
-                                  .map((s) => s.trim())
-                                  .filter(Boolean);
+                                // fallthrough to split
                               }
+                              return val
+                                .split(/[;,]/)
+                                .map((s) => s.trim())
+                                .filter(Boolean);
                             }
                             return [];
                           };
 
-                          // Uploaded numbers (user-provided)
+                          // robust digits-only string
+                          const digitsOnly = (s) => {
+                            if (s == null) return "";
+                            const m = String(s).match(/\d/g);
+                            return m ? m.join("") : "";
+                          };
+
+                          // last N digits helper (use 10 as canonical phone tail)
+                          const lastN = (s, n = 10) => {
+                            const d = digitsOnly(s);
+                            return d.length >= n ? d.slice(-n) : d;
+                          };
+
+                          // --- Build uploaded (user-provided) numbers
+                          // NOTE: intentionally exclude scraped_phone_number (which is often an enriched field)
                           const uploaded = unique([
                             ...toArray(r.phone),
                             ...toArray(r.phone_number),
-                            ...toArray(r.scraped_phone_number),
                             ...toArray(r.phone_numbers),
+                            // DO NOT include scraped_phone_number here — that may be enriched data
                           ]);
 
-                          // Enriched from ContactOut + NPI
+                          // --- Build enriched numbers (from ContactOut / NPI)
                           const coPhones = unique(toArray(r.co_phones));
                           const npiPhones = unique(toArray(r.npi_phones));
-
-                          // Combine enriched sources
                           const enrichedList = unique([
                             ...coPhones,
                             ...npiPhones,
@@ -735,10 +894,13 @@ export default function EnrichmentStep({
 
                           if (!enrichedList.length) return "-";
 
-                          // Detect duplicates (same as uploaded)
-                          const uploadedDigits = new Set(
-                            uploaded.map(normalizeDigits)
+                          // Build set of uploaded last-10 keys for fast lookup
+                          const uploadedKeys = new Set(
+                            uploaded.map((u) => lastN(u)).filter(Boolean)
                           );
+
+                          // (Optional) helpful debug output while testing — remove in production
+                          // console.debug("uploadedKeys", Array.from(uploadedKeys), "enriched", enrichedList);
 
                           return (
                             <div
@@ -749,15 +911,15 @@ export default function EnrichmentStep({
                               }}
                             >
                               {enrichedList.map((p, j) => {
-                                const dup = uploadedDigits.has(
-                                  normalizeDigits(p)
-                                );
+                                const key = lastN(p);
+                                const dup = key && uploadedKeys.has(key);
                                 return (
                                   <span
-                                    key={p + j}
+                                    key={String(p) + "-" + j}
                                     style={{
-                                      color: dup ? "#dc2626" : "#111827",
+                                      color: dup ? "#dc2626" : undefined,
                                       fontWeight: dup ? 700 : 400,
+                                      // keep other text styling default so it can be overridden by CSS if desired
                                     }}
                                   >
                                     {p}
